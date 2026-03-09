@@ -1,0 +1,47 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "EasyVietsub",
+  "version": "0.1.0",
+  "identifier": "com.easyvietsub.app",
+  "build": {
+    "frontendDist": "../build",
+    "devUrl": "http://localhost:5173"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "EasyVietsub",
+        "width": 1360,
+        "height": 860,
+        "minWidth": 1360,
+        "minHeight": 860,
+        "maxWidth": 1360,
+        "maxHeight": 860,
+        "resizable": false
+      }
+    ],
+    "security": {
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["**"]
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "createUpdaterArtifacts": false,
+    "externalBin": [
+      "binaries/ffprobe-sidecar",
+      "binaries/ffmpeg-sidecar",
+      "binaries/whisper-cli-sidecar"
+    ],
+    "resources": [
+      "../fonts/Arial.ttf",
+      "../fonts/Arial_Bold.ttf",
+      "../fonts/Arial_Italic.ttf",
+      "../fonts/Arial_Bold_Italic.ttf"
+    ]
+  }
+}

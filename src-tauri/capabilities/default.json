@@ -1,0 +1,17 @@
+{
+  "identifier": "default",
+  "description": "Default capability set for EasyVietsub desktop app.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:path:default",
+    "core:webview:default",
+    "dialog:default",
+    "fs:default",
+    "fs:allow-read-file",
+    {
+      "identifier": "fs:scope",
+      "allow": ["**"]
+    }
+  ]
+}
