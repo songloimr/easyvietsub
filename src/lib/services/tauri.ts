@@ -9,18 +9,15 @@ import type {
   RuntimeDownloadProgressEvent,
   RuntimeCapabilities,
   SubtitleSegment,
+  TranslationResult,
   WhisperModelOption
 } from '$lib/types';
+import { invokeTauri } from './tauri-commands';
 
 declare global {
   interface Window {
     __TAURI_INTERNALS__?: unknown;
   }
-}
-
-async function tauriInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
-  const { invoke } = await import('@tauri-apps/api/core');
-  return invoke<T>(command, args);
 }
 
 export function isTauriRuntime(): boolean {
@@ -100,15 +97,15 @@ export async function detectRuntimeCapabilities(): Promise<RuntimeCapabilities> 
     };
   }
 
-  return tauriInvoke<RuntimeCapabilities>('detect_runtime_capabilities');
+  return invokeTauri('detect_runtime_capabilities');
 }
 
 export async function installLocalFfmpegRuntime(): Promise<RuntimeCapabilities> {
-  return tauriInvoke<RuntimeCapabilities>('install_local_ffmpeg_runtime');
+  return invokeTauri('install_local_ffmpeg_runtime');
 }
 
 export async function removeLocalFfmpegRuntime(): Promise<RuntimeCapabilities> {
-  return tauriInvoke<RuntimeCapabilities>('remove_local_ffmpeg_runtime');
+  return invokeTauri('remove_local_ffmpeg_runtime');
 }
 
 export async function listWhisperModels(): Promise<WhisperModelOption[]> {
@@ -116,48 +113,54 @@ export async function listWhisperModels(): Promise<WhisperModelOption[]> {
     return [];
   }
 
-  return tauriInvoke<WhisperModelOption[]>('list_whisper_models');
+  return invokeTauri('list_whisper_models');
 }
 
 export async function downloadWhisperModel(modelId: string): Promise<WhisperModelOption> {
-  return tauriInvoke<WhisperModelOption>('download_whisper_model', { modelId });
+  return invokeTauri('download_whisper_model', { modelId });
 }
 
 export async function removeWhisperModel(modelId: string): Promise<WhisperModelOption> {
-  return tauriInvoke<WhisperModelOption>('remove_whisper_model', { modelId });
+  return invokeTauri('remove_whisper_model', { modelId });
 }
 
 export async function inspectMedia(filePath: string): Promise<MediaInspection> {
-  return tauriInvoke<MediaInspection>('inspect_media', { filePath });
+  return invokeTauri('inspect_media', { filePath });
 }
 
-export async function normalizeAudio(
-  jobId: string,
-  filePath: string,
-  trackIndex: number,
-  outputDirectory: string,
-  durationSeconds: number
-): Promise<string> {
-  return tauriInvoke<string>('normalize_audio', {
-    jobId,
-    filePath,
-    trackIndex,
-    outputDirectory,
-    durationSeconds
-  });
+export async function cleanupJobCache(jobId: string): Promise<void> {
+  if (!isTauriRuntime()) return;
+  return invokeTauri('cleanup_job_cache', { jobId });
+}
+
+export async function getCacheSize(): Promise<number> {
+  if (!isTauriRuntime()) return 0;
+  return invokeTauri('get_cache_size');
+}
+
+export async function cleanupAllCache(): Promise<void> {
+  if (!isTauriRuntime()) return;
+  return invokeTauri('cleanup_all_cache');
+}
+
+export async function cleanupOldCache(days: number): Promise<number> {
+  if (!isTauriRuntime()) return 0;
+  return invokeTauri('cleanup_old_cache', { days });
 }
 
 export async function transcribeWithWhisper(payload: {
   jobId: string;
   audioPath: string;
+  trackIndex: number;
   sourceLanguage: string;
   modelId: string;
   computeMode: string;
 }): Promise<SubtitleSegment[]> {
-  return tauriInvoke<SubtitleSegment[]>('transcribe_with_whisper', {
+  return invokeTauri('transcribe_with_whisper', {
     jobId: payload.jobId,
     payload: {
       audioPath: payload.audioPath,
+      trackIndex: payload.trackIndex,
       sourceLanguage: payload.sourceLanguage,
       modelId: payload.modelId,
       computeMode: payload.computeMode
@@ -166,26 +169,30 @@ export async function transcribeWithWhisper(payload: {
 }
 
 export async function translateSegmentsWithGemini(payload: {
+  jobId: string;
   apiKey: string;
   modelId: string;
   translationInstruction: string;
   segments: SubtitleSegment[];
-}): Promise<SubtitleSegment[]> {
-  return tauriInvoke<SubtitleSegment[]>('translate_segments_with_gemini', { payload });
+}): Promise<TranslationResult> {
+  return invokeTauri('translate_segments_with_gemini', { payload });
 }
 
 export async function transcribeDirectWithGemini(payload: {
+  jobId: string;
   apiKey: string;
   modelId: string;
   audioPath: string;
+  trackIndex: number;
+  durationSeconds: number;
   sourceLanguage: string;
   translationInstruction: string;
-}): Promise<SubtitleSegment[]> {
-  return tauriInvoke<SubtitleSegment[]>('transcribe_direct_with_gemini', { payload });
+}): Promise<TranslationResult> {
+  return invokeTauri('transcribe_direct_with_gemini', { payload });
 }
 
 export async function fetchSupportedGeminiModels(apiKey: string): Promise<GeminiModelOption[]> {
-  return tauriInvoke<GeminiModelOption[]>('fetch_supported_gemini_models', { apiKey });
+  return invokeTauri('fetch_supported_gemini_models', { apiKey });
 }
 
 export async function renderHardSubtitle(payload: {
@@ -196,7 +203,7 @@ export async function renderHardSubtitle(payload: {
   style: JobRecord['style'];
   durationSeconds: number;
 }): Promise<string> {
-  return tauriInvoke<string>('render_hard_subtitle', {
+  return invokeTauri('render_hard_subtitle', {
     jobId: payload.jobId,
     durationSeconds: payload.durationSeconds,
     payload: {
@@ -213,7 +220,7 @@ export async function exportAssSubtitle(payload: {
   segments: SubtitleSegment[];
   style: JobRecord['style'];
 }): Promise<void> {
-  return tauriInvoke<void>('export_ass_subtitle', {
+  return invokeTauri('export_ass_subtitle', {
     path: payload.path,
     segments: payload.segments,
     style: payload.style
@@ -221,26 +228,26 @@ export async function exportAssSubtitle(payload: {
 }
 
 export async function cancelPipelineProcess(jobId: string): Promise<void> {
-  return tauriInvoke<void>('cancel_pipeline_process', { jobId });
+  return invokeTauri('cancel_pipeline_process', { jobId });
 }
 
 export async function loadAppSettings(): Promise<AppSettings> {
-  return tauriInvoke<AppSettings>('load_app_settings');
+  return invokeTauri('load_app_settings');
 }
 
 export async function saveProjectSnapshot(payload: {
   path: string;
   snapshot: ProjectSnapshot;
 }): Promise<void> {
-  return tauriInvoke<void>('save_project_snapshot', payload);
+  return invokeTauri('save_project_snapshot', payload);
 }
 
 export async function loadProjectSnapshot(payload: { path: string }): Promise<ProjectSnapshot> {
-  return tauriInvoke<ProjectSnapshot>('load_project_snapshot', payload);
+  return invokeTauri('load_project_snapshot', payload);
 }
 
 export async function persistAppSettings(settings: AppSettings): Promise<void> {
-  await tauriInvoke<void>('persist_app_settings', { settings });
+  await invokeTauri('persist_app_settings', { settings });
 }
 
 export async function listenToPipelineProgress(
@@ -304,4 +311,22 @@ export async function getAssetUrl(filePath: string): Promise<string> {
   const assetUrl = convertFileSrc(filePath);
   console.log('[getAssetUrl] Converted:', filePath, '→', assetUrl);
   return assetUrl;
+}
+
+/**
+ * Convert a local file path to a stream:// URL that supports HTTP Range requests.
+ * This is needed for large video files where the asset:// protocol doesn't support seeking.
+ */
+export function getStreamUrl(filePath: string): string {
+  if (!filePath || filePath.trim() === '') {
+    return '';
+  }
+
+  if (!isTauriRuntime()) {
+    return filePath;
+  }
+
+  // Encode the file path for use in URL
+  const encoded = encodeURIComponent(filePath);
+  return `stream://localhost/${encoded}`;
 }

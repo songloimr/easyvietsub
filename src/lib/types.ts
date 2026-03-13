@@ -19,7 +19,7 @@ export type JobPhase =
   | 'failed'
   | 'cancelled';
 
-export type JobStatus = 'draft' | 'running' | 'completed' | 'failed' | 'cancelled';
+export type JobStatus = 'draft' | 'running' | 'completed' | 'failed' | 'cancelled' | 'partial';
 
 export interface AudioTrackInfo {
   index: number;
@@ -54,12 +54,23 @@ export interface GeminiModelOption {
   experimental?: boolean;
 }
 
+export interface TokenUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+}
+
 export interface SubtitleSegment {
   id: string;
   startMs: number;
   endMs: number;
   sourceText: string;
   translatedText: string;
+}
+
+export interface TranslationResult {
+  segments: SubtitleSegment[];
+  tokenUsage: TokenUsage;
 }
 
 export interface SubtitleStyle {
@@ -110,7 +121,6 @@ export interface JobRecord {
   etaSeconds?: number | null;
   message: string;
   inspection?: MediaInspection | null;
-  normalizedAudioPath?: string | null;
   sourceSegments: SubtitleSegment[];
   translatedSegments: SubtitleSegment[];
   form: JobFormState;
@@ -120,6 +130,7 @@ export interface JobRecord {
     translatedSrtPath?: string | null;
     renderedVideoPath?: string | null;
   };
+  tokenUsage?: TokenUsage;
 }
 
 export interface PipelineProgressEvent {

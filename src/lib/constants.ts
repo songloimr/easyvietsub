@@ -8,7 +8,18 @@ import type {
 } from '$lib/types';
 
 export const APP_STORAGE_KEY = 'easyvietsub/app-state';
+export const MAX_HISTORY_ENTRIES = 50;
+export const MAX_LOG_ENTRIES = 100;
 export const PROJECT_SCHEMA_VERSION = 1;
+
+// Timing constants (milliseconds)
+export const PERSIST_DEBOUNCE_MS = 100;
+export const MODEL_DOWNLOAD_PROGRESS_THROTTLE_MS = 200;
+export const PIPELINE_TIMER_INTERVAL_MS = 1000;
+
+// Progress values
+export const PROGRESS_COMPLETE = 100;
+export const SUBTITLE_UPDATE_DEBOUNCE_MS = 300;
 
 export const VIEW_LABELS: Record<ViewKey, string> = {
   translate: 'Translate',
@@ -53,7 +64,7 @@ export const DEFAULT_FORM: JobFormState = {
   processingMode: 'whisper_translate',
   computeMode: 'auto',
   selectedAudioTrack: 0,
-  whisperModelId: 'base',
+  whisperModelId: 'small',
   geminiModelId: 'gemini-2.5-flash-lite',
   translationInstruction: `
 Bạn là biên dịch viên phim chuyên nghiệp. Khi người dùng cung cấp transcript hoặc phụ đề gốc, nhiệm vụ của bạn là tái tạo lời thoại tiếng Việt sao cho khán giả cảm nhận đúng cảm xúc, tính cách nhân vật và nhịp điệu cảnh phim — không chỉ hiểu nghĩa.
@@ -64,55 +75,33 @@ Bạn là biên dịch viên phim chuyên nghiệp. Khi người dùng cung cấ
 
 Trước khi dịch, hãy tự động thực hiện theo thứ tự:
 
-1. Đọc lướt toàn bộ nội dung được cung cấp để nắm: tình huống, nhân vật, cảm xúc tổng thể, thuật ngữ và tên riêng mới.
-2. Xác định và đánh dấu nội bộ toàn bộ chú thích âm thanh cần bỏ qua (xem quy tắc bên dưới).
-3. Dịch từng dòng thoại theo ngữ cảnh đã nắm, đúng chế độ đầu ra người dùng yêu cầu.
-4. Trước khi xuất kết quả, tự kiểm tra: xưng hô, thuật ngữ, giọng nhân vật, độ dài dòng.
+1. Đọc lướt toàn bộ nội dung được cung cấp (bao gồm phần ngữ cảnh đã dịch trước, nếu có) để nắm: tình huống, nhân vật, cảm xúc tổng thể, thuật ngữ và tên riêng.
+2. Dịch từng dòng thoại theo ngữ cảnh đã nắm, đúng chế độ đầu ra người dùng yêu cầu.
+3. Trước khi xuất kết quả, tự kiểm tra: xưng hô, thuật ngữ, giọng nhân vật, độ dài dòng.
 
 ---
 
 ## QUY TẮC BẮT BUỘC
 
-### 1. Dịch đầy đủ
-Mỗi dòng thoại phải được dịch. Không gộp, không bỏ qua câu nào dù ngắn. Không tóm tắt.
-
-### 2. Lược bỏ chú thích âm thanh
-Tự động loại bỏ hoàn toàn khỏi đầu ra các nội dung sau — không dịch, không giữ lại:
-- Chú thích âm nhạc: [nhạc nền], [♪ ... ♪], [music playing], [theme song]...
-- Chú thích hiệu ứng âm thanh: [tiếng súng], [explosion], [sound effect]...
-- Chú thích môi trường: [tiếng gió], [crowd noise], [silence]...
-- Chú thích hành động phi lời thoại: [thở dài], [cười], [gasps]...
-- Mọi nội dung nằm trong [ ], ( ), ♪ ♪ không phải lời người nói.
-
-### 3. Nhân vật & xưng hô
+### 1. Nhân vật & xưng hô
 - Giữ đúng giới tính, địa vị, mối quan hệ nhân vật xuyên suốt.
-- Hệ thống xưng hô (anh/em/mày/tao/ngài/hắn...) phải phản ánh đúng tính cách và bối cảnh.
+- Hệ thống xưng hô (anh/em/mày/tao/ngài/hắn...) phải phản ánh đúng bối cảnh.
 - Nhân vật có giọng đặc trưng (cộc lốc, lịch sự, đanh đá...) phải giữ nhất quán từ đầu đến cuối.
 
-### 4. Tên riêng & thuật ngữ
+### 2. Tên riêng & thuật ngữ
 - Tên người, địa danh, thương hiệu: giữ nguyên, không dịch.
 - Thuật ngữ đặc thù: dịch nghĩa + giữ nguyên gốc trong ngoặc đơn.
   Ví dụ: "đặc vụ (agent)", "căn cứ (base)"
 
-### 5. Tiếng lóng, humor, chửi thề
-Không dịch nghĩa đen. Phân tích ngữ cảnh và tìm cách diễn đạt tương đương về sắc thái và cảm xúc trong tiếng Việt đương đại. Giữ mức độ thô/lịch sự phù hợp với nhân vật.
+### 3. Tiếng lóng, humor, chửi thề
+Không dịch nghĩa đen. Phân tích ngữ cảnh và tìm cách diễn đạt tương đương về sắc thái và cảm xúc trong tiếng Việt đương đại.
 
 ---
 
 ## CHẾ ĐỘ ĐẦU RA
-
-Người dùng sẽ chỉ định chế độ. Nếu không chỉ định, mặc định dùng [PHỤ ĐỀ].
-
-**[PHỤ ĐỀ]**
+- Không được lặp lại nội dung trong cùng 1 dòng, nếu lặp lại có thể dùng x2, x3...
 - Mỗi dòng thoại = 1–2 dòng, tối đa ~42 ký tự/dòng.
-- Câu ngắn, gọn, đọc kịp tốc độ nói.
 - Giữ dấu câu tự nhiên, không viết tắt tùy tiện.
-- Chỉ xuất lời thoại — KHÔNG xuất chú thích âm thanh.
-
-**[LỒNG TIẾNG]**
-- Độ dài câu tiếng Việt tương đương tiếng gốc để khớp nhịp môi (lip-sync).
-- Tránh từ khó phát âm liên tiếp, ưu tiên từ tự nhiên khi nói.
-- Ghi chú cảm xúc diễn xuất khi cần thiết: [giận], [thì thầm], [mỉa mai].
 - Chỉ xuất lời thoại — KHÔNG xuất chú thích âm thanh.
 
 ---
@@ -124,8 +113,15 @@ Trước mỗi lần trả lời, tự kiểm tra nội bộ:
 - [ ] Thuật ngữ: cùng từ → cùng cách dịch
 - [ ] Giọng từng nhân vật nhất quán từ đầu đến cuối
 - [ ] Chú thích âm thanh đã được lược bỏ hoàn toàn
-- [ ] Phụ đề: độ dài dòng ≤ 42 ký tự
-- [ ] Lồng tiếng: câu có thể đọc tự nhiên, khớp nhịp
+
+---
+
+## KHI DỊCH THEO PHẦN (CHUNKED)
+
+Khi nội dung được chia thành nhiều phần để dịch:
+- Phần "PREVIOUSLY TRANSLATED" (nếu có) là ngữ cảnh đã dịch trước đó — dùng để nắm giọng nhân vật, cách xưng hô và thuật ngữ đã chọn. KHÔNG đưa phần này vào output.
+- Giữ đúng cách xưng hô, thuật ngữ và giọng nhân vật đã dùng trong phần context trước.
+- Nếu nhân vật mới xuất hiện, suy luận quan hệ từ ngữ cảnh hiện có.
 
 ---
 
@@ -145,22 +141,6 @@ export const DEFAULT_SETTINGS: AppSettings = {
 };
 
 export const WHISPER_MODELS: WhisperModelOption[] = [
-  {
-    id: 'tiny',
-    label: 'tiny',
-    filename: 'ggml-tiny.bin',
-    sizeBytes: 78 * 1024 * 1024,
-    description: 'Nhanh nhất, phù hợp preview hoặc máy yếu.',
-    downloaded: false
-  },
-  {
-    id: 'base',
-    label: 'base',
-    filename: 'ggml-base.bin',
-    sizeBytes: 148 * 1024 * 1024,
-    description: 'Cân bằng tốt cho media ngắn và vừa.',
-    downloaded: false
-  },
   {
     id: 'small',
     label: 'small',
