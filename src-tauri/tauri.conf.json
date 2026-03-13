@@ -13,11 +13,9 @@
         "title": "EasyVietsub",
         "width": 1360,
         "height": 860,
-        "minWidth": 1360,
-        "minHeight": 860,
-        "maxWidth": 1360,
-        "maxHeight": 860,
-        "resizable": false
+        "minWidth": 1280,
+        "minHeight": 720,
+        "resizable": true
       }
     ],
     "security": {
@@ -29,13 +27,16 @@
     }
   },
   "bundle": {
+    "icon": [
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
     "active": true,
     "targets": "all",
     "createUpdaterArtifacts": false,
     "externalBin": [
       "binaries/ffprobe-sidecar",
-      "binaries/ffmpeg-sidecar",
-      "binaries/whisper-cli-sidecar"
+      "binaries/ffmpeg-sidecar"
     ],
     "resources": [
       "../fonts/Arial.ttf",

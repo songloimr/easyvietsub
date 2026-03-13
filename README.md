@@ -1,120 +1,71 @@
 # EasyVietsub
 
-EasyVietsub là ứng dụng desktop dùng `SvelteKit + Tauri` để xử lý quy trình làm phụ đề tiếng Việt cho video/audio: inspect media, chuyển giọng nói thành văn bản, dịch sang tiếng Việt, xuất subtitle và render hard-sub.
+Ứng dụng desktop chuyên vietsub phim JAV — hỗ trợ tạo, chỉnh sửa và gắn phụ đề tiếng Việt vào video.
+
+## Screenshots
+
+<!-- Thêm screenshots tại đây -->
+
+*Screenshots coming soon.*
 
 ## Tính năng chính
 
-- Chọn file video/audio và inspect metadata, audio track, thời lượng.
-- Hỗ trợ 2 chế độ xử lý:
-  - `Whisper local + Gemini translate`
-  - `Gemini direct audio` (experimental)
-- Tùy chỉnh prompt dịch, chọn Gemini model và Whisper model.
-- Quản lý FFmpeg local và tải/xóa Whisper model ngay trong app.
-- Chỉnh style subtitle, preview và render video hard-sub.
-- Export `SRT` / `ASS`, lưu và import project snapshot `.easyvietsub.json`.
-- Có history và process log để theo dõi từng job.
+- **Nhận dạng & dịch tự động** — chuyển giọng nói thành text (Whisper) và dịch sang tiếng Việt (Gemini)
+- **Chỉnh sửa phụ đề** — editor trực quan, preview realtime ngay trong app
+- **Export & render** — xuất file SRT / ASS hoặc render hard-sub trực tiếp vào video
 
-## Stack
+## Yêu cầu
 
-- Frontend: `SvelteKit 2`, `Svelte 5`, `TypeScript`, `Tailwind CSS v4`
-- Desktop runtime: `Tauri 2`
-- Backend native: `Rust`
-- Subtitle editor: `TipTap`
-- Media pipeline: `FFmpeg`, `ffprobe`, `whisper-rs`, Gemini API
+- [Node.js](https://nodejs.org/) >= 20 và npm
+- [Rust](https://www.rust-lang.org/tools/install) (stable)
+- [Tauri 2 Prerequisites](https://v2.tauri.app/start/prerequisites/)
+- Gemini API key — lấy tại [Google AI Studio](https://aistudio.google.com/apikey)
 
-## Yêu cầu môi trường
+> FFmpeg có thể cài global hoặc để app dùng sidecar đi kèm. Xem phần [Sidecars](#sidecars) bên dưới.
 
-- `Node.js` 20+
-- `npm`
-- `Rust` toolchain stable
-- Máy có thể chạy Tauri 2
-- Gemini API key để dịch / dùng chế độ Gemini direct
-
-Ghi chú:
-
-- App có thể cài FFmpeg local trong phần Settings trên một số nền tảng hỗ trợ.
-- Trước khi chạy Tauri, cần có sidecar binary đúng target.
-
-## Cài đặt
+## Cài đặt & Chạy
 
 ```bash
+# 1. Clone repo
+git clone https://github.com/<your-username>/easyvietsub.git
+cd easyvietsub
+
+# 2. Cài dependencies
 npm install
-```
 
-## Chạy dự án
-
-Chạy frontend:
-
-```bash
-npm run dev
-```
-
-Chạy app desktop với Tauri:
-
-```bash
+# 3. Build sidecars (xem phần Sidecars)
 npm run sidecars:build
+
+# 4. Chạy dev
 npm run tauri dev
-```
 
-Build production:
-
-```bash
-npm run build
+# 5. Build production
 npm run tauri build
 ```
 
 ## Sidecars
 
-Repo này dùng các sidecar launcher cho:
+App đi kèm 3 sidecar binary: **ffmpeg**, **ffprobe** và **whisper-cli**.
 
-- `ffmpeg`
-- `ffprobe`
-- `whisper-cli`
-
-Build sidecar theo target hiện tại:
+Các binary này cần được build/copy vào `src-tauri/binaries/` theo đúng naming convention của Tauri (kèm target triple).
 
 ```bash
+# macOS / Linux
 npm run sidecars:build
-```
 
-Build sidecar cho Windows:
-
-```powershell
+# Windows (PowerShell)
 npm run sidecars:build:windows
 ```
 
-Các file sidecar sinh ra trong `src-tauri/binaries/` hiện đã được thêm vào `.gitignore` vì đây là artifact build theo máy/target. Khi clone repo mới, chỉ cần build lại sidecar trước khi chạy Tauri.
+> Thư mục `src-tauri/binaries/` đã được thêm vào `.gitignore`. Chi tiết xem tại [`src-tauri/binaries/README.md`](src-tauri/binaries/README.md).
 
-## Cách dùng cơ bản
+## Contributing
 
-1. Mở app và nhập Gemini API key trong tab `Settings`.
-2. Cài FFmpeg local nếu máy chưa có `ffmpeg` / `ffprobe`.
-3. Nếu dùng chế độ Whisper, tải model phù hợp trong `Settings`.
-4. Chọn file media ở tab `Translate`.
-5. Chạy pipeline để tạo transcript và subtitle tiếng Việt.
-6. Kiểm tra/chỉnh subtitle, chọn thư mục output.
-7. Export subtitle hoặc render video hard-sub.
+1. Fork repo
+2. Tạo branch mới (`git checkout -b feature/ten-tinh-nang`)
+3. Commit changes
+4. Mở Pull Request
 
-## Scripts hữu ích
+## License
 
-```bash
-npm run dev
-npm run check
-npm run build
-npm run preview
-npm run tauri dev
-npm run tauri build
-npm run sidecars:build
-npm run sidecars:build:windows
-```
-
-## Cấu trúc thư mục
-
-```text
-src/                 giao diện SvelteKit
-src/lib/             store, service, type, utility
-src-tauri/           mã Rust + cấu hình Tauri
-scripts/             script build sidecar
-static/              asset tĩnh
-fonts/               font dùng khi render subtitle
-```
+[MIT](LICENSE)
