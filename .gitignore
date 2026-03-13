@@ -14,6 +14,7 @@ src-tauri/binaries/ffmpeg-sidecar-*
 src-tauri/binaries/ffprobe-sidecar-*
 src-tauri/binaries/whisper-cli-sidecar-*
 
+*.py
 *.log
 npm-debug.log*
 yarn-debug.log*
