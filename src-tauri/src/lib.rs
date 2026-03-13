@@ -1,12 +1,17 @@
+mod error;
+
 use base64::Engine;
+use error::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
+use tauri::http::Response as HttpResponse;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_shell::{
     process::{CommandChild, CommandEvent},
@@ -14,14 +19,37 @@ use tauri_plugin_shell::{
 };
 
 use tokio::io::AsyncWriteExt;
+use memmap2::Mmap;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
+// ==================== CONSTANTS ====================
+
+// Gemini API configuration
 const GEMINI_MODELS_ALLOWLIST: &[&str] = &[
     "gemini-3.1-flash-lite-preview",
     "gemini-2.5-flash-lite",
     "gemini-2.5-flash",
     "gemini-3-flash-preview",
 ];
+
+/// Number of subtitle segments per translation chunk.
+const TRANSLATION_CHUNK_SIZE: usize = 300;
+/// Minimum chunk size for adaptive chunking.
+const MIN_CHUNK_SIZE: usize = 50;
+/// Maximum chunk size for adaptive chunking.
+const MAX_CHUNK_SIZE: usize = 500;
+/// Number of previously-translated segments sent as context for continuity.
+const TRANSLATION_CONTEXT_SIZE: usize = 20;
+/// Maximum retry depth when splitting an oversized chunk in half.
+const MAX_CHUNK_SPLIT_DEPTH: usize = 2;
+/// Audio chunk duration for Gemini direct mode (seconds).
+const GEMINI_AUDIO_CHUNK_DURATION_SECS: f64 = 20.0;
+
+// Stream protocol configuration
+/// Stream chunk size for video streaming (2MB).
+const STREAM_CHUNK_SIZE: u64 = 2 * 1024 * 1024;
+
+// ==================== DATA STRUCTURES ====================
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -72,6 +100,32 @@ struct SubtitleSegment {
     end_ms: u64,
     source_text: String,
     translated_text: String,
+}
+
+/// Token usage statistics from Gemini API calls.
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct TokenUsage {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+}
+
+impl TokenUsage {
+    /// Accumulate tokens from another TokenUsage.
+    fn accumulate(&mut self, other: &TokenUsage) {
+        self.prompt_tokens += other.prompt_tokens;
+        self.completion_tokens += other.completion_tokens;
+        self.total_tokens += other.total_tokens;
+    }
+}
+
+/// Translation result containing segments and token usage.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TranslationResult {
+    segments: Vec<SubtitleSegment>,
+    token_usage: TokenUsage,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -143,16 +197,35 @@ struct RuntimeDownloadProgressEvent {
     message: String,
 }
 
-#[derive(Default)]
 struct RunningProcesses {
     jobs: Mutex<HashMap<String, CommandChild>>,
-    whisper_cancel_tokens: Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+    /// Cancel tokens for Whisper transcription jobs (checked during inference and segment reading).
+    whisper_cancel_tokens: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Cancel tokens for Gemini translation jobs (checked between chunks).
+    gemini_cancel_tokens: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Cached WhisperContext to avoid reloading the model on every transcription.
+    /// Tuple: (model_path, use_gpu, context).
+    whisper_ctx_cache: Mutex<Option<(String, bool, Arc<WhisperContext>)>>,
+    /// Shared HTTP client for Gemini API calls (reuses connections/TLS sessions).
+    http_client: reqwest::Client,
 }
 
-fn migrate_project_snapshot(snapshot: ProjectSnapshot) -> Result<ProjectSnapshot, String> {
+impl Default for RunningProcesses {
+    fn default() -> Self {
+        Self {
+            jobs: Mutex::default(),
+            whisper_cancel_tokens: Mutex::default(),
+            gemini_cancel_tokens: Mutex::default(),
+            whisper_ctx_cache: Mutex::new(None),
+            http_client: reqwest::Client::new(),
+        }
+    }
+}
+
+fn migrate_project_snapshot(snapshot: ProjectSnapshot) -> AppResult<ProjectSnapshot> {
     match snapshot.version {
         1 => Ok(snapshot),
-        _ => Err("Project schema version hiện chưa được hỗ trợ để migrate.".into()),
+        _ => Err(AppError::validation("Project schema version hiện chưa được hỗ trợ để migrate.", None)),
     }
 }
 
@@ -160,6 +233,7 @@ fn migrate_project_snapshot(snapshot: ProjectSnapshot) -> Result<ProjectSnapshot
 #[serde(rename_all = "camelCase")]
 struct WhisperRequest {
     audio_path: String,
+    track_index: u32,
     source_language: String,
     model_id: String,
     compute_mode: String,
@@ -168,6 +242,7 @@ struct WhisperRequest {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GeminiTranslateRequest {
+    job_id: String,
     api_key: String,
     model_id: String,
     translation_instruction: String,
@@ -177,9 +252,12 @@ struct GeminiTranslateRequest {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GeminiDirectRequest {
+    job_id: String,
     api_key: String,
     model_id: String,
     audio_path: String,
+    track_index: u32,
+    duration_seconds: f64,
     source_language: String,
     translation_instruction: String,
 }
@@ -213,22 +291,6 @@ struct RenderRequest {
 fn whisper_model_catalog() -> Vec<(String, String, String, u64, String, String)> {
     vec![
         (
-            "tiny".into(),
-            "tiny".into(),
-            "ggml-tiny.bin".into(),
-            78 * 1024 * 1024,
-            "Nhanh nhất, phù hợp preview hoặc máy yếu.".into(),
-            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin".into(),
-        ),
-        (
-            "base".into(),
-            "base".into(),
-            "ggml-base.bin".into(),
-            148 * 1024 * 1024,
-            "Cân bằng tốt cho media ngắn và vừa.".into(),
-            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin".into(),
-        ),
-        (
             "small".into(),
             "small".into(),
             "ggml-small.bin".into(),
@@ -255,42 +317,42 @@ fn whisper_model_catalog() -> Vec<(String, String, String, u64, String, String)>
     ]
 }
 
-fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
+fn app_data_dir(app: &AppHandle) -> AppResult<PathBuf> {
     let dir = app
         .path()
         .app_data_dir()
-        .map_err(|error| error.to_string())?;
-    fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+        ?;
+    fs::create_dir_all(&dir)?;
     Ok(dir)
 }
 
-fn app_cache_dir(app: &AppHandle) -> Result<PathBuf, String> {
+fn app_cache_dir(app: &AppHandle) -> AppResult<PathBuf> {
     let dir = app
         .path()
         .app_cache_dir()
-        .map_err(|error| error.to_string())?;
-    fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+        ?;
+    fs::create_dir_all(&dir)?;
     Ok(dir)
 }
 
-fn models_dir(app: &AppHandle) -> Result<PathBuf, String> {
+fn models_dir(app: &AppHandle) -> AppResult<PathBuf> {
     let dir = app_data_dir(app)?.join("models");
-    fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    fs::create_dir_all(&dir)?;
     Ok(dir)
 }
 
-fn tools_dir(app: &AppHandle) -> Result<PathBuf, String> {
+fn tools_dir(app: &AppHandle) -> AppResult<PathBuf> {
     let dir = app_data_dir(app)?.join("tools");
-    fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    fs::create_dir_all(&dir)?;
     Ok(dir)
 }
 
-fn fonts_dir(app: &AppHandle) -> Result<PathBuf, String> {
+fn fonts_dir(app: &AppHandle) -> AppResult<PathBuf> {
     // Priority 1: Try bundled resources directory (production)
     let resources_dir = app
         .path()
         .resource_dir()
-        .map_err(|error| error.to_string())?;
+        ?;
     
     if resources_dir.join("Arial.ttf").exists() {
         return Ok(resources_dir);
@@ -300,7 +362,7 @@ fn fonts_dir(app: &AppHandle) -> Result<PathBuf, String> {
     // macOS dev:   target/debug/bundle/macos/App.app/Contents/MacOS/exe (many levels)
     // Windows dev: target/debug/exe.exe (fewer levels)
     // Walk up to a reasonable depth (max 8 ancestors) to stay robust across OSes.
-    let exe_path = std::env::current_exe().map_err(|error| error.to_string())?;
+    let exe_path = std::env::current_exe()?;
     let mut ancestor = exe_path.as_path();
     for _ in 0..8 {
         if let Some(parent) = ancestor.parent() {
@@ -316,11 +378,11 @@ fn fonts_dir(app: &AppHandle) -> Result<PathBuf, String> {
     
     // Fallback: app data dir with fonts subdirectory
     let dir = app_data_dir(app)?.join("fonts");
-    fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    fs::create_dir_all(&dir)?;
     Ok(dir)
 }
 
-fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
+fn settings_path(app: &AppHandle) -> AppResult<PathBuf> {
     Ok(app_data_dir(app)?.join("settings.json"))
 }
 
@@ -332,12 +394,12 @@ fn command_filename(name: &str) -> String {
     }
 }
 
-fn managed_binary_path(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
+fn managed_binary_path(app: &AppHandle, name: &str) -> AppResult<PathBuf> {
     Ok(tools_dir(app)?.join(command_filename(name)))
 }
 
-fn bundled_sidecar_path(name: &str) -> Result<PathBuf, String> {
-    let exe_path = std::env::current_exe().map_err(|error| error.to_string())?;
+fn bundled_sidecar_path(name: &str) -> AppResult<PathBuf> {
+    let exe_path = std::env::current_exe()?;
     let exe_dir = exe_path
         .parent()
         .ok_or_else(|| "Không xác định được thư mục executable.".to_string())?;
@@ -355,7 +417,7 @@ fn resolve_runtime_binary_path(
     managed_name: &str,
     sidecar_name: &str,
     system_name: &str,
-) -> Result<PathBuf, String> {
+) -> AppResult<PathBuf> {
     let managed = managed_binary_path(app, managed_name)?;
     if managed.exists() {
         return Ok(managed);
@@ -366,14 +428,14 @@ fn resolve_runtime_binary_path(
         return Ok(sidecar);
     }
 
-    which::which(system_name).map_err(|error| error.to_string())
+    Ok(which::which(system_name)?)
 }
 
-fn resolve_ffmpeg_path(app: &AppHandle) -> Result<PathBuf, String> {
+fn resolve_ffmpeg_path(app: &AppHandle) -> AppResult<PathBuf> {
     resolve_runtime_binary_path(app, "ffmpeg", "ffmpeg-sidecar", "ffmpeg")
 }
 
-fn resolve_ffprobe_path(app: &AppHandle) -> Result<PathBuf, String> {
+fn resolve_ffprobe_path(app: &AppHandle) -> AppResult<PathBuf> {
     resolve_runtime_binary_path(app, "ffprobe", "ffprobe-sidecar", "ffprobe")
 }
 
@@ -385,25 +447,22 @@ async fn download_to_path_with_progress(
     start_progress: u64,
     end_progress: u64,
     message: &str,
-) -> Result<(), String> {
+) -> AppResult<()> {
     let mut response = reqwest::Client::new()
         .get(url)
         .send()
         .await
-        .map_err(|error| error.to_string())?;
+        ?;
 
     if !response.status().is_success() {
-        return Err(format!(
-            "Tải runtime thất bại với status {}",
-            response.status()
-        ));
+        return Err(AppError::network(format!("Tải runtime thất bại với status {}", response.status()), None, None));
     }
 
     let total_bytes = response.content_length().unwrap_or_default();
     let mut downloaded_bytes = 0_u64;
     let mut file = tokio::fs::File::create(destination)
         .await
-        .map_err(|error| error.to_string())?;
+        ?;
 
     emit_runtime_download_progress(
         app,
@@ -414,10 +473,10 @@ async fn download_to_path_with_progress(
         message.to_string(),
     );
 
-    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+    while let Some(chunk) = response.chunk().await? {
         file.write_all(&chunk)
             .await
-            .map_err(|error| error.to_string())?;
+            ?;
         downloaded_bytes += chunk.len() as u64;
 
         let progress = if total_bytes == 0 {
@@ -439,7 +498,7 @@ async fn download_to_path_with_progress(
         );
     }
 
-    file.flush().await.map_err(|error| error.to_string())?;
+    file.flush().await?;
 
     emit_runtime_download_progress(
         app,
@@ -453,18 +512,18 @@ async fn download_to_path_with_progress(
     Ok(())
 }
 
-fn extract_first_file_from_zip(zip_path: &Path, destination: &Path) -> Result<(), String> {
-    let source = fs::File::open(zip_path).map_err(|error| error.to_string())?;
-    let mut archive = zip::ZipArchive::new(source).map_err(|error| error.to_string())?;
+fn extract_first_file_from_zip(zip_path: &Path, destination: &Path) -> AppResult<()> {
+    let source = fs::File::open(zip_path)?;
+    let mut archive = zip::ZipArchive::new(source)?;
 
     for index in 0..archive.len() {
-        let mut entry = archive.by_index(index).map_err(|error| error.to_string())?;
+        let mut entry = archive.by_index(index)?;
         if !entry.is_file() {
             continue;
         }
 
-        let mut output = fs::File::create(destination).map_err(|error| error.to_string())?;
-        io::copy(&mut entry, &mut output).map_err(|error| error.to_string())?;
+        let mut output = fs::File::create(destination)?;
+        io::copy(&mut entry, &mut output)?;
 
         #[cfg(unix)]
         {
@@ -472,16 +531,16 @@ fn extract_first_file_from_zip(zip_path: &Path, destination: &Path) -> Result<()
 
             let mut permissions = output
                 .metadata()
-                .map_err(|error| error.to_string())?
+                ?
                 .permissions();
             permissions.set_mode(0o755);
-            fs::set_permissions(destination, permissions).map_err(|error| error.to_string())?;
+            fs::set_permissions(destination, permissions)?;
         }
 
         return Ok(());
     }
 
-    Err("Archive runtime không chứa binary hợp lệ.".into())
+    Err(AppError::file_system("Archive runtime không chứa binary hợp lệ.", None))
 }
 
 /// Extract a named file from a 7z archive to destination path.
@@ -490,7 +549,7 @@ fn extract_named_file_from_7z(
     archive_path: &Path,
     file_name: &str,
     destination: &Path,
-) -> Result<(), String> {
+) -> AppResult<()> {
     use std::time::{SystemTime, UNIX_EPOCH};
     
     // Create temp directory to extract full archive
@@ -499,11 +558,11 @@ fn extract_named_file_from_7z(
         .unwrap()
         .as_millis();
     let temp_dir = std::env::temp_dir().join(format!("easyvietsub_7z_{}", timestamp));
-    fs::create_dir_all(&temp_dir).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&temp_dir)?;
 
     // Extract full archive to temp dir
     sevenz_rust::decompress_file(archive_path, &temp_dir)
-        .map_err(|e| format!("Không thể giải nén 7z archive: {}", e))?;
+        .map_err(|e| AppError::file_system(format!("Không thể giải nén 7z archive: {}", e), None))?;
 
     // Find the target file recursively
     let mut found_path: Option<PathBuf> = None;
@@ -526,20 +585,20 @@ fn extract_named_file_from_7z(
         Ok(())
     }
 
-    walk_dir(&temp_dir, file_name, &mut found_path).map_err(|e| e.to_string())?;
+    walk_dir(&temp_dir, file_name, &mut found_path)?;
 
     if let Some(source) = found_path {
         // Copy to destination
-        fs::copy(&source, destination).map_err(|e| e.to_string())?;
+        fs::copy(&source, destination)?;
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mut permissions = fs::metadata(destination)
-                .map_err(|e| e.to_string())?
+                ?
                 .permissions();
             permissions.set_mode(0o755);
-            fs::set_permissions(destination, permissions).map_err(|e| e.to_string())?;
+            fs::set_permissions(destination, permissions)?;
         }
 
         // Cleanup temp dir
@@ -547,10 +606,7 @@ fn extract_named_file_from_7z(
         Ok(())
     } else {
         let _ = fs::remove_dir_all(&temp_dir);
-        Err(format!(
-            "Không tìm thấy file '{}' trong 7z archive.",
-            file_name
-        ))
+        Err(AppError::file_system(format!("Không tìm thấy file '{}' trong 7z archive.", file_name), None))
     }
 }
 
@@ -598,11 +654,11 @@ fn register_running_process(
     state: &State<RunningProcesses>,
     job_id: &str,
     child: CommandChild,
-) -> Result<(), String> {
+) -> AppResult<()> {
     let mut jobs = state
         .jobs
         .lock()
-        .map_err(|_| "Không khóa được process registry.".to_string())?;
+        ?;
     if let Some(existing) = jobs.remove(job_id) {
         let _ = existing.kill();
     }
@@ -613,11 +669,11 @@ fn register_running_process(
 fn take_running_process(
     state: &State<RunningProcesses>,
     job_id: &str,
-) -> Result<Option<CommandChild>, String> {
+) -> AppResult<Option<CommandChild>> {
     let mut jobs = state
         .jobs
         .lock()
-        .map_err(|_| "Không khóa được process registry.".to_string())?;
+        ?;
     Ok(jobs.remove(job_id))
 }
 
@@ -683,16 +739,16 @@ fn ass_alignment(position: &str) -> u8 {
     }
 }
 
-fn srt_timestamp_to_ms(input: &str) -> Result<u64, String> {
+fn srt_timestamp_to_ms(input: &str) -> AppResult<u64> {
     let parts: Vec<&str> = input.split([':', ',']).collect();
     if parts.len() != 4 {
-        return Err(format!("Timestamp không hợp lệ: {input}"));
+        return Err(AppError::validation(format!("Timestamp không hợp lệ: {input}"), None));
     }
 
-    let hours = parts[0].parse::<u64>().map_err(|error| error.to_string())?;
-    let minutes = parts[1].parse::<u64>().map_err(|error| error.to_string())?;
-    let seconds = parts[2].parse::<u64>().map_err(|error| error.to_string())?;
-    let millis = parts[3].parse::<u64>().map_err(|error| error.to_string())?;
+    let hours = parts[0].parse::<u64>()?;
+    let minutes = parts[1].parse::<u64>()?;
+    let seconds = parts[2].parse::<u64>()?;
+    let millis = parts[3].parse::<u64>()?;
     Ok(hours * 3_600_000 + minutes * 60_000 + seconds * 1_000 + millis)
 }
 
@@ -704,7 +760,46 @@ fn ms_to_ass_timestamp(ms: u64) -> String {
     format!("{hours}:{minutes:02}:{seconds:02}.{centiseconds:02}")
 }
 
-fn parse_srt(input: &str) -> Result<Vec<SubtitleSegment>, String> {
+fn ms_to_srt_timestamp(ms: u64) -> String {
+    let hours = ms / 3_600_000;
+    let minutes = (ms % 3_600_000) / 60_000;
+    let seconds = (ms % 60_000) / 1_000;
+    let millis = ms % 1_000;
+    format!("{hours:02}:{minutes:02}:{seconds:02},{millis:03}")
+}
+
+fn segments_to_srt_string(segments: &[SubtitleSegment]) -> String {
+    segments
+        .iter()
+        .enumerate()
+        .map(|(i, seg)| {
+            format!(
+                "{}\n{} --> {}\n{}",
+                i + 1,
+                ms_to_srt_timestamp(seg.start_ms),
+                ms_to_srt_timestamp(seg.end_ms),
+                seg.source_text.trim()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn strip_markdown_code_block(text: &str) -> &str {
+    let trimmed = text.trim();
+    if let Some(rest) = trimmed.strip_prefix("```") {
+        // Skip the language tag line (e.g. "```srt\n")
+        let rest = rest
+            .find('\n')
+            .map(|pos| &rest[pos + 1..])
+            .unwrap_or(rest);
+        rest.strip_suffix("```").unwrap_or(rest).trim()
+    } else {
+        trimmed
+    }
+}
+
+fn parse_srt(input: &str) -> AppResult<Vec<SubtitleSegment>> {
     let normalized = input.replace("\r\n", "\n");
     let mut segments = Vec::new();
 
@@ -720,7 +815,7 @@ fn parse_srt(input: &str) -> Result<Vec<SubtitleSegment>, String> {
         let time_line = lines[1];
         let timestamps: Vec<&str> = time_line.split(" --> ").collect();
         if timestamps.len() != 2 {
-            return Err(format!("Block SRT không hợp lệ ở index {index}"));
+            return Err(AppError::validation(format!("Block SRT không hợp lệ ở index {index}"), None));
         }
 
         let start_ms = srt_timestamp_to_ms(timestamps[0])?;
@@ -743,7 +838,7 @@ fn write_ass_file(
     path: &Path,
     segments: &[SubtitleSegment],
     style: &RenderStyle,
-) -> Result<(), String> {
+) -> AppResult<()> {
     let primary = ass_color(&style.text_color);
     let outline = ass_color(&style.outline_color);
     let back = ass_color(&style.background_color);
@@ -775,7 +870,6 @@ fn write_ass_file(
         let text = segment
             .translated_text
             .replace('\n', "\\N")
-            .replace(',', "\\,")
             .replace('{', "\\{")
             .replace('}', "\\}");
         content.push_str(&format!(
@@ -786,7 +880,7 @@ fn write_ass_file(
         ));
     }
 
-    fs::write(path, content).map_err(|error| error.to_string())
+    Ok(fs::write(path, content)?)
 }
 
 #[tauri::command]
@@ -794,7 +888,7 @@ fn export_ass_subtitle(
     path: String,
     segments: Vec<SubtitleSegment>,
     style: RenderStyle,
-) -> Result<(), String> {
+) -> AppResult<()> {
     let path = Path::new(&path);
     write_ass_file(path, &segments, &style)
 }
@@ -821,7 +915,7 @@ fn detect_runtime_capabilities(app: AppHandle) -> RuntimeCapabilities {
 }
 
 #[tauri::command]
-async fn install_local_ffmpeg_runtime(app: AppHandle) -> Result<RuntimeCapabilities, String> {
+async fn install_local_ffmpeg_runtime(app: AppHandle) -> AppResult<RuntimeCapabilities> {
     let tools = tools_dir(&app)?;
     let ffmpeg_path = managed_binary_path(&app, "ffmpeg")?;
     let ffprobe_path = managed_binary_path(&app, "ffprobe")?;
@@ -924,10 +1018,7 @@ async fn install_local_ffmpeg_runtime(app: AppHandle) -> Result<RuntimeCapabilit
         }
 
         other => {
-            return Err(format!(
-                "Hệ điều hành '{}' chưa được hỗ trợ tải FFmpeg tự động. Vui lòng cài FFmpeg thủ công.",
-                other
-            ));
+            return Err(AppError::configuration(format!("Hệ điều hành '{}' chưa được hỗ trợ tải FFmpeg tự động. Vui lòng cài FFmpeg thủ công.", other), None));
         }
     }
 
@@ -935,23 +1026,23 @@ async fn install_local_ffmpeg_runtime(app: AppHandle) -> Result<RuntimeCapabilit
 }
 
 #[tauri::command]
-fn remove_local_ffmpeg_runtime(app: AppHandle) -> Result<RuntimeCapabilities, String> {
+fn remove_local_ffmpeg_runtime(app: AppHandle) -> AppResult<RuntimeCapabilities> {
     let ffmpeg_path = managed_binary_path(&app, "ffmpeg")?;
     let ffprobe_path = managed_binary_path(&app, "ffprobe")?;
 
     if ffmpeg_path.exists() {
-        fs::remove_file(&ffmpeg_path).map_err(|error| error.to_string())?;
+        fs::remove_file(&ffmpeg_path)?;
     }
 
     if ffprobe_path.exists() {
-        fs::remove_file(&ffprobe_path).map_err(|error| error.to_string())?;
+        fs::remove_file(&ffprobe_path)?;
     }
 
     Ok(detect_runtime_capabilities(app))
 }
 
 #[tauri::command]
-fn list_whisper_models(app: AppHandle) -> Result<Vec<WhisperModelOption>, String> {
+fn list_whisper_models(app: AppHandle) -> AppResult<Vec<WhisperModelOption>> {
     let dir = models_dir(&app)?;
     Ok(whisper_model_catalog()
         .into_iter()
@@ -972,7 +1063,7 @@ fn list_whisper_models(app: AppHandle) -> Result<Vec<WhisperModelOption>, String
 async fn download_whisper_model(
     app: AppHandle,
     model_id: String,
-) -> Result<WhisperModelOption, String> {
+) -> AppResult<WhisperModelOption> {
     let dir = models_dir(&app)?;
     let (_, label, filename, size_bytes, description, url) = whisper_model_catalog()
         .into_iter()
@@ -983,26 +1074,23 @@ async fn download_whisper_model(
         .get(url)
         .send()
         .await
-        .map_err(|error| error.to_string())?;
+        ?;
 
     if !response.status().is_success() {
-        return Err(format!(
-            "Tải model thất bại với status {}",
-            response.status()
-        ));
+        return Err(AppError::network(format!("Tải model thất bại với status {}", response.status()), None, None));
     }
 
     let path = dir.join(&filename);
     let mut file = tokio::fs::File::create(&path)
         .await
-        .map_err(|error| error.to_string())?;
+        ?;
     let total_bytes = response.content_length().unwrap_or(size_bytes);
     let mut downloaded_bytes = 0_u64;
 
-    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+    while let Some(chunk) = response.chunk().await? {
         file.write_all(&chunk)
             .await
-            .map_err(|error| error.to_string())?;
+            ?;
         downloaded_bytes += chunk.len() as u64;
 
         let progress = if total_bytes == 0 {
@@ -1022,10 +1110,10 @@ async fn download_whisper_model(
                 total_bytes,
             },
         )
-        .map_err(|error| error.to_string())?;
+        ?;
     }
 
-    file.flush().await.map_err(|error| error.to_string())?;
+    file.flush().await?;
 
     Ok(WhisperModelOption {
         id: model_id,
@@ -1038,7 +1126,7 @@ async fn download_whisper_model(
 }
 
 #[tauri::command]
-fn remove_whisper_model(app: AppHandle, model_id: String) -> Result<WhisperModelOption, String> {
+fn remove_whisper_model(app: AppHandle, model_id: String) -> AppResult<WhisperModelOption> {
     let dir = models_dir(&app)?;
     let (_, label, filename, size_bytes, description, _) = whisper_model_catalog()
         .into_iter()
@@ -1047,7 +1135,7 @@ fn remove_whisper_model(app: AppHandle, model_id: String) -> Result<WhisperModel
 
     let path = dir.join(&filename);
     if path.exists() {
-        fs::remove_file(&path).map_err(|error| error.to_string())?;
+        fs::remove_file(&path)?;
     }
 
     Ok(WhisperModelOption {
@@ -1061,7 +1149,7 @@ fn remove_whisper_model(app: AppHandle, model_id: String) -> Result<WhisperModel
 }
 
 #[tauri::command]
-async fn inspect_media(app: AppHandle, file_path: String) -> Result<MediaInspection, String> {
+async fn inspect_media(app: AppHandle, file_path: String) -> AppResult<MediaInspection> {
     let ffprobe = resolve_ffprobe_path(&app)?;
     let output = app
         .shell()
@@ -1077,15 +1165,15 @@ async fn inspect_media(app: AppHandle, file_path: String) -> Result<MediaInspect
         ])
         .output()
         .await
-        .map_err(|error| error.to_string())?;
+        ?;
 
     if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        return Err(AppError::media_processing(String::from_utf8_lossy(&output.stderr).trim().to_string(), None));
     }
 
     let raw = String::from_utf8_lossy(&output.stdout).to_string();
 
-    let value: Value = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
+    let value: Value = serde_json::from_str(&raw)?;
     let streams = value["streams"]
         .as_array()
         .ok_or_else(|| "Không đọc được streams từ ffprobe.".to_string())?;
@@ -1142,128 +1230,7 @@ async fn inspect_media(app: AppHandle, file_path: String) -> Result<MediaInspect
         file_size_bytes,
         audio_tracks,
         sample_rate,
-    })
-}
-
-#[tauri::command]
-async fn normalize_audio(
-    app: AppHandle,
-    state: State<'_, RunningProcesses>,
-    job_id: String,
-    file_path: String,
-    track_index: i64,
-    output_directory: String,
-    duration_seconds: f64,
-) -> Result<String, String> {
-    let output_root = if output_directory.trim().is_empty() {
-        app_cache_dir(&app)?.join("normalized")
-    } else {
-        PathBuf::from(output_directory)
-    };
-    fs::create_dir_all(&output_root).map_err(|error| error.to_string())?;
-
-    let stem = Path::new(&file_path)
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("audio");
-    let output_path = output_root.join(format!("{}-normalized.mp3", stem));
-
-    let (mut rx, child) = app
-        .shell()
-        .command(resolve_ffmpeg_path(&app)?)
-        .args([
-            "-y",
-            "-i",
-            &file_path,
-            "-map",
-            &format!("0:{track_index}"),
-            "-vn",
-            "-acodec",
-            "libmp3lame",
-            "-progress",
-            "pipe:1",
-            "-nostats",
-            output_path.to_string_lossy().as_ref(),
-        ])
-        .spawn()
-        .map_err(|error| error.to_string())?;
-
-    register_running_process(&state, &job_id, child)?;
-    emit_progress(
-        &app,
-        &job_id,
-        "preprocess",
-        10.0,
-        "FFmpeg đang normalize audio.",
-        None,
-    );
-
-    let mut stderr_lines: Vec<String> = Vec::new();
-
-    while let Some(event) = rx.recv().await {
-        match event {
-            CommandEvent::Stdout(line) => {
-                let text = String::from_utf8_lossy(&line).trim().to_string();
-                if let Some(current_ms) = parse_ffmpeg_progress_ms(&text) {
-                    let total_ms = (duration_seconds.max(1.0) * 1000.0) as u64;
-                    let ratio = (current_ms as f64 / total_ms as f64).clamp(0.0, 1.0);
-                    let progress = 10.0 + ratio * 12.0;
-                    let eta = if current_ms > 0 {
-                        let remaining_ms = total_ms.saturating_sub(current_ms);
-                        Some(remaining_ms / 1000)
-                    } else {
-                        None
-                    };
-                    emit_progress(
-                        &app,
-                        &job_id,
-                        "preprocess",
-                        progress,
-                        "Đang normalize audio sang mp3.",
-                        eta,
-                    );
-                }
-            }
-            CommandEvent::Stderr(line) => {
-                let text = String::from_utf8_lossy(&line).trim().to_string();
-                if !text.is_empty() {
-                    stderr_lines.push(text.clone());
-                    emit_progress(&app, &job_id, "preprocess", 10.0, text, None);
-                }
-            }
-            CommandEvent::Error(message) => {
-                let _ = take_running_process(&state, &job_id)?;
-                return Err(message);
-            }
-            CommandEvent::Terminated(payload) => {
-                let removed = take_running_process(&state, &job_id)?;
-                if payload.code == Some(0) {
-                    emit_progress(
-                        &app,
-                        &job_id,
-                        "preprocess",
-                        22.0,
-                        "Audio đã sẵn sàng.",
-                        Some(0),
-                    );
-                    if removed.is_some() {
-                        break;
-                    }
-                } else if removed.is_none() {
-                    return Err("Job đã bị hủy bởi người dùng.".into());
-                } else {
-                    let ffmpeg_log = stderr_lines.join("\n");
-                    return Err(format!(
-                        "FFmpeg normalize thất bại với code {:?}\n\n--- FFmpeg log ---\n{}",
-                        payload.code, ffmpeg_log
-                    ));
-                }
-            }
-            _ => {}
-        }
-    }
-
-    Ok(output_path.to_string_lossy().to_string())
+     })
 }
 
 #[tauri::command]
@@ -1272,16 +1239,14 @@ async fn transcribe_with_whisper(
     state: State<'_, RunningProcesses>,
     job_id: String,
     payload: WhisperRequest,
-) -> Result<Vec<SubtitleSegment>, String> {
+) -> AppResult<Vec<SubtitleSegment>> {
     let model = whisper_model_catalog()
         .into_iter()
         .find(|(id, _, _, _, _, _)| id == &payload.model_id)
-        .ok_or_else(|| "Model Whisper không hợp lệ.".to_string())?;
+        .ok_or_else(|| AppError::model("Model Whisper không hợp lệ.", None))?;
     let model_path = models_dir(&app)?.join(model.2);
     if !model_path.exists() {
-        return Err(
-            "Whisper model chưa được tải. Hãy tải model trong phần setup trước khi chạy.".into(),
-        );
+        return Err(AppError::model("Whisper model chưa được tải. Hãy tải model trong phần setup trước khi chạy.", None));
     }
 
     let normalized_compute_mode = payload.compute_mode.to_lowercase();
@@ -1336,7 +1301,7 @@ async fn transcribe_with_whisper(
         let mut tokens = state
             .whisper_cancel_tokens
             .lock()
-            .map_err(|_| "Không khóa được cancel tokens.".to_string())?;
+            ?;
         tokens.insert(job_id.clone(), Arc::clone(&cancel_token));
     }
 
@@ -1344,14 +1309,44 @@ async fn transcribe_with_whisper(
     let job_id_clone = job_id.clone();
     let model_path_str = model_path.to_string_lossy().to_string();
     let audio_path = payload.audio_path.clone();
+    let track_index = payload.track_index;
     let source_language = payload.source_language.clone();
+
+    // Retrieve or create a cached WhisperContext to avoid reloading the model every time.
+    let whisper_ctx: Arc<WhisperContext> = {
+        let mut cache = state
+            .whisper_ctx_cache
+            .lock()
+            ?;
+
+        if let Some((ref cached_path, cached_gpu, ref ctx)) = *cache {
+            if cached_path == &model_path_str && cached_gpu == use_gpu {
+                Arc::clone(ctx)
+            } else {
+                // Model or GPU setting changed — drop old, load new.
+                let mut ctx_params = WhisperContextParameters::default();
+                ctx_params.use_gpu(use_gpu);
+                let new_ctx = Arc::new(
+                    WhisperContext::new_with_params(&model_path_str, ctx_params)
+                        .map_err(|e| AppError::model(format!("Không tải được Whisper model: {e}"), None))?,
+                );
+                *cache = Some((model_path_str.clone(), use_gpu, Arc::clone(&new_ctx)));
+                new_ctx
+            }
+        } else {
+            let mut ctx_params = WhisperContextParameters::default();
+            ctx_params.use_gpu(use_gpu);
+            let new_ctx = Arc::new(
+                WhisperContext::new_with_params(&model_path_str, ctx_params)
+                    .map_err(|e| AppError::model(format!("Không tải được Whisper model: {e}"), None))?,
+            );
+            *cache = Some((model_path_str.clone(), use_gpu, Arc::clone(&new_ctx)));
+            new_ctx
+        }
+    };
 
     // Run blocking whisper-rs inference on a dedicated thread.
     let result = tokio::task::spawn_blocking(move || {
-        let mut ctx_params = WhisperContextParameters::default();
-        ctx_params.use_gpu(use_gpu);
-        let ctx = WhisperContext::new_with_params(&model_path_str, ctx_params)
-            .map_err(|error| format!("Không tải được Whisper model: {error}"))?;
 
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_temperature(0.1);
@@ -1375,9 +1370,8 @@ async fn transcribe_with_whisper(
             None,
         );
 
-        // Load and decode audio to 16kHz mono f32 samples using hound or direct WAV reading.
-        // whisper-rs expects 16kHz mono f32 PCM.
-        let samples = load_audio_as_f32(&app_clone, &audio_path)?;
+        // Decode audio directly from source to 16kHz mono f32 PCM (cached per job).
+        let mapped_audio = load_audio_as_f32(&app_clone, &audio_path, track_index, &job_id_clone)?;
 
         emit_progress(
             &app_clone,
@@ -1388,13 +1382,39 @@ async fn transcribe_with_whisper(
             None,
         );
 
-        let mut state_whisper = ctx
+        // Set up progress callback to emit real-time progress during inference.
+        {
+            let cb_app = app_clone.clone();
+            let cb_job_id = job_id_clone.clone();
+            params.set_progress_callback_safe(move |progress| {
+                // Map whisper 0-100% to pipeline 50-63%.
+                let pipeline_pct = 50.0 + (progress as f64 * 0.13);
+                emit_progress(
+                    &cb_app,
+                    &cb_job_id,
+                    "transcribe",
+                    pipeline_pct,
+                    &format!("Đang nhận dạng giọng nói... {}%", progress),
+                    None,
+                );
+            });
+        }
+
+        // Set up abort callback to allow cancellation during inference.
+        {
+            let cb_cancel_token = Arc::clone(&cancel_token);
+            params.set_abort_callback_safe(move || {
+                cb_cancel_token.load(std::sync::atomic::Ordering::Relaxed)
+            });
+        }
+
+        let mut state_whisper = whisper_ctx
             .create_state()
-            .map_err(|error| format!("Không khởi tạo được Whisper state: {error}"))?;
+            .map_err(|error| AppError::model(format!("Không khởi tạo được Whisper state: {error}"), None))?;
 
         state_whisper
-            .full(params, &samples)
-            .map_err(|error| format!("Whisper inference thất bại: {error}"))?;
+            .full(params, mapped_audio.samples())
+            .map_err(|error| AppError::model(format!("Whisper inference thất bại: {error}"), None))?;
 
         emit_progress(
             &app_clone,
@@ -1407,24 +1427,24 @@ async fn transcribe_with_whisper(
 
         let num_segments = state_whisper
             .full_n_segments()
-            .map_err(|error| format!("Không đọc được số segments: {error}"))?;
+            .map_err(|error| AppError::model(format!("Không đọc được số segments: {error}"), None))?;
 
         let mut subtitle_segments = Vec::new();
         for i in 0..num_segments {
             if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
-                return Err("Job đã bị hủy bởi người dùng.".to_string());
+                return Err(AppError::cancelled("Job đã bị hủy bởi người dùng.", None));
             }
 
             let text = state_whisper
                 .full_get_segment_text(i)
-                .map_err(|error| format!("Không đọc được segment text {i}: {error}"))?;
+                .map_err(|error| AppError::model(format!("Không đọc được segment text {i}: {error}"), None))?;
             let start_ms = (state_whisper
                 .full_get_segment_t0(i)
-                .map_err(|error| format!("Không đọc được t0 segment {i}: {error}"))?
+                .map_err(|error| AppError::model(format!("Không đọc được segment timestamp {i}: {error}"), None))?
                 * 10) as u64;
             let end_ms = (state_whisper
                 .full_get_segment_t1(i)
-                .map_err(|error| format!("Không đọc được t1 segment {i}: {error}"))?
+                .map_err(|error| AppError::model(format!("Không đọc được segment timestamp {i}: {error}"), None))?
                 * 10) as u64;
 
             let text = text.trim().to_string();
@@ -1444,16 +1464,18 @@ async fn transcribe_with_whisper(
         Ok(subtitle_segments)
     })
     .await
-    .map_err(|error| format!("Whisper thread panic: {error}"))?;
+    .map_err(|error| AppError::model(format!("Whisper thread panic: {error}"), None))?;
 
     // Clean up cancel token.
     {
         let mut tokens = state
             .whisper_cancel_tokens
             .lock()
-            .map_err(|_| "Không khóa được cancel tokens.".to_string())?;
+            ?;
         tokens.remove(&job_id);
     }
+
+    // PCM cache file is kept for potential retries — cleanup via cleanup_job_cache.
 
     match result {
         Ok(segments) => {
@@ -1471,16 +1493,74 @@ async fn transcribe_with_whisper(
     }
 }
 
-/// Load audio file to 16kHz mono f32 PCM samples using ffmpeg (system or managed).
+/// Audio samples backed by a memory-mapped temp file.
+/// Keeps the mmap alive so the `&[f32]` slice remains valid.
+struct MappedAudio {
+    #[allow(dead_code)]
+    mmap: Mmap,
+    sample_count: usize,
+}
+
+impl MappedAudio {
+    /// Get the audio samples as a `&[f32]` slice (zero-copy from mmap).
+    fn samples(&self) -> &[f32] {
+        // SAFETY: mmap is aligned to page boundary (always >= 4-byte aligned),
+        // sample_count was validated so sample_count * 4 <= mmap.len(),
+        // and the file was written as f32le by ffmpeg.
+        unsafe { std::slice::from_raw_parts(self.mmap.as_ptr() as *const f32, self.sample_count) }
+    }
+}
+
+/// Load audio from a source media file to 16kHz mono f32 PCM samples using ffmpeg.
+/// Decodes directly from the source (mp4/mkv/mp3/etc.) — no intermediate WAV needed.
+/// Output is cached per job_id so retries skip the decode step.
 /// This is a blocking function, to be called inside spawn_blocking.
-fn load_audio_as_f32(app: &AppHandle, audio_path: &str) -> Result<Vec<f32>, String> {
-    // Use resolved ffmpeg path (managed → sidecar → system) instead of bare "ffmpeg".
+fn load_audio_as_f32(
+    app: &AppHandle,
+    source_path: &str,
+    track_index: u32,
+    job_id: &str,
+) -> AppResult<MappedAudio> {
+    let cache_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| AppError::file_system(format!("Không lấy được cache dir: {error}"), None))?;
+    let pcm_dir = cache_dir.join("whisper-pcm");
+    fs::create_dir_all(&pcm_dir)
+        .map_err(|error| AppError::file_system(format!("Không tạo được whisper-pcm dir: {error}"), None))?;
+
+    let pcm_path = pcm_dir.join(format!("{job_id}.raw"));
+
+    // Reuse cached PCM file if it exists and is valid.
+    if pcm_path.exists() {
+        if let Ok(meta) = fs::metadata(&pcm_path) {
+            let len = meta.len() as usize;
+            if len > 0 && len % 4 == 0 {
+                let file = fs::File::open(&pcm_path)
+                    .map_err(|e| AppError::file_system(format!("Không mở được cached PCM file: {e}"), None))?;
+                let mmap = unsafe { Mmap::map(&file) }
+                    .map_err(|e| AppError::file_system(format!("Không mmap được cached PCM file: {e}"), None))?;
+                return Ok(MappedAudio {
+                    mmap,
+                    sample_count: len / 4,
+                });
+            }
+        }
+        // Invalid cache file — remove and re-decode.
+        let _ = fs::remove_file(&pcm_path);
+    }
+
     let ffmpeg = resolve_ffmpeg_path(app)?;
+    let track_map = format!("0:{}", track_index);
+
     let output = Command::new(&ffmpeg)
         .args([
             "-y",
             "-i",
-            audio_path,
+            source_path,
+            "-map",
+            &track_map,
+            "-vn",
             "-f",
             "f32le",
             "-acodec",
@@ -1489,131 +1569,564 @@ fn load_audio_as_f32(app: &AppHandle, audio_path: &str) -> Result<Vec<f32>, Stri
             "1",
             "-ar",
             "16000",
-            "pipe:1",
         ])
+        .arg(pcm_path.as_os_str())
+        .stderr(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
         .output()
-        .map_err(|error| format!("Không thể chạy ffmpeg để decode audio: {error}"))?;
+        .map_err(|error| AppError::media_processing(format!("Không thể chạy ffmpeg để decode audio: {error}"), None))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ffmpeg decode audio thất bại: {stderr}"));
+        let _ = fs::remove_file(&pcm_path);
+        return Err(AppError::media_processing(format!("ffmpeg decode audio thất bại: {stderr}"), None));
     }
 
-    let bytes = output.stdout;
-    if bytes.len() % 4 != 0 {
-        return Err("Dữ liệu audio PCM không hợp lệ (không chia hết cho 4).".into());
+    let file = fs::File::open(&pcm_path)
+        .map_err(|error| AppError::file_system(format!("Không mở được PCM file: {error}"), None))?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| AppError::file_system(format!("Không đọc được metadata PCM: {error}"), None))?
+        .len() as usize;
+
+    if file_len == 0 {
+        let _ = fs::remove_file(&pcm_path);
+        return Err(AppError::media_processing("ffmpeg decode audio ra file rỗng.", None));
+    }
+    if file_len % 4 != 0 {
+        let _ = fs::remove_file(&pcm_path);
+        return Err(AppError::validation("Dữ liệu audio PCM không hợp lệ (không chia hết cho 4).", None));
     }
 
-    let samples: Vec<f32> = bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect();
+    // SAFETY: The file was just written by ffmpeg and is not modified concurrently.
+    let mmap = unsafe { Mmap::map(&file) }
+        .map_err(|error| AppError::file_system(format!("Không mmap được PCM file: {error}"), None))?;
 
-    Ok(samples)
+    let sample_count = file_len / 4;
+    Ok(MappedAudio { mmap, sample_count })
 }
 
-fn extract_text_part(response: &Value) -> Result<String, String> {
+fn extract_text_part(response: &Value) -> AppResult<String> {
     response["candidates"][0]["content"]["parts"][0]["text"]
         .as_str()
         .map(|value| value.to_string())
-        .ok_or_else(|| "Gemini response không chứa text hợp lệ.".to_string())
+        .ok_or_else(|| AppError::model("Gemini response không chứa text hợp lệ.", None))
 }
 
-async fn call_gemini(api_key: &str, model_id: &str, body: Value) -> Result<Value, String> {
+/// Extract token usage metadata from Gemini API response.
+fn extract_token_usage(response: &Value) -> TokenUsage {
+    let meta = &response["usageMetadata"];
+    TokenUsage {
+        prompt_tokens: meta["promptTokenCount"].as_u64().unwrap_or(0),
+        completion_tokens: meta["candidatesTokenCount"].as_u64().unwrap_or(0),
+        total_tokens: meta["totalTokenCount"].as_u64().unwrap_or(0),
+    }
+}
+
+async fn call_gemini(
+    client: &reqwest::Client,
+    api_key: &str,
+    model_id: &str,
+    body: Value,
+) -> AppResult<Value> {
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
         model_id, api_key
     );
-    let response = reqwest::Client::new()
+    let response = client
         .post(url)
         .json(&body)
         .send()
         .await
-        .map_err(|error| error.to_string())?;
+        ?;
 
     if !response.status().is_success() {
-        return Err(format!(
-            "Gemini request thất bại với status {}",
-            response.status()
-        ));
+        return Err(AppError::network(format!("Gemini request thất bại với status {}", response.status()), None, None));
     }
 
-    response
+    Ok(response
         .json::<Value>()
-        .await
-        .map_err(|error| error.to_string())
+        .await?)
 }
 
-#[tauri::command]
-async fn translate_segments_with_gemini(
-    payload: GeminiTranslateRequest,
-) -> Result<Vec<SubtitleSegment>, String> {
-    let simplified_segments = payload
-        .segments
-        .iter()
-        .map(|segment| {
-            json!({
-                "id": segment.id,
-                "source_text": segment.source_text
-            })
-        })
-        .collect::<Vec<_>>();
+/// Build a context-aware SRT string for a translation chunk.
+/// `context_pairs` contains previously-translated segments (source + translated)
+/// shown to the model for continuity but NOT included in its output.
+fn build_chunk_prompt(
+    instruction: &str,
+    chunk: &[SubtitleSegment],
+    context_pairs: &[(String, String)], // (source_text, translated_text)
+    chunk_idx: usize,
+    total_chunks: usize,
+) -> String {
+    let srt_body = segments_to_srt_string(chunk);
+    let segment_count = chunk.len();
 
-    let prompt = format!(
-        "User instruction: {}\n\n\
-        Return ONLY a JSON object: {{\"segments\":[{{\"id\":\"...\",\"translated_text\":\"...\"}}]}}",
-        payload.translation_instruction
-    );
+    let context_section = if context_pairs.is_empty() {
+        String::new()
+    } else {
+        let lines: Vec<String> = context_pairs
+            .iter()
+            .map(|(src, tl)| format!("[SRC] {} → [VI] {}", src, tl))
+            .collect();
+        format!(
+            "\n=== PREVIOUSLY TRANSLATED (for context only, do NOT include in output) ===\n{}\n\n",
+            lines.join("\n")
+        )
+    };
+
+    let part_label = if total_chunks > 1 {
+        format!(" (Part {}/{})", chunk_idx + 1, total_chunks)
+    } else {
+        String::new()
+    };
+
+    format!(
+        "User instruction: {instruction}\n\n\
+        Translate the following SRT subtitle file{part_label}. \
+        Return ONLY the translated SRT file with the exact same format and same number of segments ({segment_count}). \
+        Keep all segment numbers and timestamps exactly as they are. \
+        Only translate the text content. \
+        Do NOT add any explanation, commentary, or markdown formatting.\
+        {context_section}\n\
+        === TRANSLATE THE FOLLOWING ===\n\
+        {srt_body}"
+    )
+}
+
+/// Translate a single chunk of segments via Gemini.
+/// Returns Ok((translated_segments, token_usage)) on success, Err(reason) on failure.
+async fn translate_single_chunk(
+    client: &reqwest::Client,
+    api_key: &str,
+    model_id: &str,
+    instruction: &str,
+    chunk: &[SubtitleSegment],
+    context_pairs: &[(String, String)],
+    chunk_idx: usize,
+    total_chunks: usize,
+) -> AppResult<(Vec<SubtitleSegment>, TokenUsage)> {
+    let prompt = build_chunk_prompt(instruction, chunk, context_pairs, chunk_idx, total_chunks);
+    let expected_count = chunk.len();
 
     let body = json!({
         "contents": [
             {
                 "role": "user",
-                "parts": [
-                    { "text": prompt },
-                    { "text": serde_json::to_string(&simplified_segments).map_err(|error| error.to_string())? }
-                ]
+                "parts": [{ "text": prompt }]
             }
         ],
         "generationConfig": {
-            "responseMimeType": "application/json"
+            "maxOutputTokens": 1048576
         }
     });
 
-    let response = call_gemini(&payload.api_key, &payload.model_id, body).await?;
-    let text = extract_text_part(&response)?;
-    let parsed: Value = serde_json::from_str(&text).map_err(|error| error.to_string())?;
-    let translated = parsed["segments"]
-        .as_array()
-        .ok_or_else(|| "Gemini không trả về segments hợp lệ.".to_string())?;
+    let response = call_gemini(client, api_key, model_id, body).await?;
 
-    let translated_map = translated
-        .iter()
-        .filter_map(|segment| {
-            let id = segment["id"].as_str()?;
-            let translated_text = segment["translated_text"].as_str()?;
-            Some((id.to_string(), translated_text.to_string()))
-        })
-        .collect::<std::collections::HashMap<_, _>>();
+    // Extract token usage
+    let token_usage = extract_token_usage(&response);
 
-    Ok(payload
-        .segments
-        .into_iter()
-        .map(|mut segment| {
-            segment.translated_text = translated_map
-                .get(&segment.id)
-                .cloned()
-                .unwrap_or_else(|| segment.source_text.clone());
-            segment
-        })
-        .collect())
+    // Check finishReason
+    let finish_reason = response["candidates"][0]["finishReason"]
+        .as_str()
+        .unwrap_or("UNKNOWN");
+
+    if finish_reason == "MAX_TOKENS" {
+        return Err(AppError::model("MAX_TOKENS", None));
+    }
+    if finish_reason != "STOP" {
+        return Err(AppError::model(format!("finishReason: {}", finish_reason), None));
+    }
+
+    // Extract and parse
+    let raw_text = extract_text_part(&response)?;
+    let srt_text = strip_markdown_code_block(&raw_text);
+    let translated = parse_srt(srt_text)?;
+
+    if translated.len() != expected_count {
+        eprintln!(
+            "[translate] Chunk {}/{}: segment count differs (expected {}, got {}). Accepting as-is.",
+            chunk_idx + 1,
+            total_chunks,
+            expected_count,
+            translated.len()
+        );
+    }
+
+    Ok((translated, token_usage))
 }
 
-fn chunk_audio(app: &AppHandle, audio_path: &str, duration: f64) -> Result<Vec<(PathBuf, u64, u64)>, String> {
-    let ffmpeg = resolve_ffmpeg_path(app)?;
-    let chunks_dir = app_cache_dir(app)?.join("gemini-direct");
-    fs::create_dir_all(&chunks_dir).map_err(|error| error.to_string())?;
+/// Translate a chunk with adaptive retry: on failure, split in half and retry each sub-chunk.
+/// `depth` limits recursive splitting (0 = first attempt, MAX_CHUNK_SPLIT_DEPTH = stop splitting).
+/// Returns (translated_segments, accumulated_token_usage).
+fn translate_chunk_with_retry<'a>(
+    client: &'a reqwest::Client,
+    api_key: &'a str,
+    model_id: &'a str,
+    instruction: &'a str,
+    chunk: &'a [SubtitleSegment],
+    context_pairs: &'a [(String, String)],
+    chunk_idx: usize,
+    total_chunks: usize,
+    depth: usize,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = AppResult<(Vec<SubtitleSegment>, TokenUsage)>> + Send + 'a>> {
+    Box::pin(async move {
+    // Try translating the whole chunk first
+    match translate_single_chunk(
+        client,
+        api_key,
+        model_id,
+        instruction,
+        chunk,
+        context_pairs,
+        chunk_idx,
+        total_chunks,
+    )
+    .await
+    {
+        Ok((segments, token_usage)) => return Ok((segments, token_usage)),
+        Err(error) => {
+            eprintln!(
+                "[translate] Chunk {}/{} failed (depth {}): {}",
+                chunk_idx + 1,
+                total_chunks,
+                depth,
+                error
+            );
 
+            // If we haven't reached max split depth and chunk is splittable, split in half
+            if depth < MAX_CHUNK_SPLIT_DEPTH && chunk.len() > 1 {
+                let mid = chunk.len() / 2;
+                let (first_half, second_half) = chunk.split_at(mid);
+
+                eprintln!(
+                    "[translate] Splitting chunk into {} + {} segments (depth {})",
+                    first_half.len(),
+                    second_half.len(),
+                    depth + 1
+                );
+
+                // Translate first half
+                let (first_result, first_tokens) = translate_chunk_with_retry(
+                    client,
+                    api_key,
+                    model_id,
+                    instruction,
+                    first_half,
+                    context_pairs,
+                    chunk_idx,
+                    total_chunks,
+                    depth + 1,
+                )
+                .await?;
+
+                // Build context from the tail of first_result for the second half
+                let tail_count = first_result.len().min(TRANSLATION_CONTEXT_SIZE);
+                let mut second_context = context_pairs.to_vec();
+                for seg in first_result.iter().skip(first_result.len() - tail_count) {
+                    second_context.push((
+                        seg.source_text.clone(),
+                        seg.translated_text.clone(),
+                    ));
+                }
+
+                // Translate second half
+                let (second_result, second_tokens) = translate_chunk_with_retry(
+                    client,
+                    api_key,
+                    model_id,
+                    instruction,
+                    second_half,
+                    &second_context,
+                    chunk_idx,
+                    total_chunks,
+                    depth + 1,
+                )
+                .await?;
+
+                // Combine results and accumulate tokens
+                let mut combined = first_result;
+                combined.extend(second_result);
+                
+                let mut total_tokens = first_tokens;
+                total_tokens.accumulate(&second_tokens);
+                
+                return Ok((combined, total_tokens));
+            }
+
+            // Can't split further – propagate error
+            return Err(error);
+        }
+    }
+    })
+}
+
+/// Calculate adaptive chunk size based on segment characteristics.
+/// - For small sets (<100 segments): use smaller chunks for faster feedback
+/// - For medium sets (100-500): use standard chunk size
+/// - For large sets (>500): use larger chunks for efficiency
+/// - Adjust based on average text length per segment
+fn calculate_adaptive_chunk_size(segments: &[SubtitleSegment]) -> usize {
+    let total_segments = segments.len();
+
+    if total_segments == 0 {
+        return MIN_CHUNK_SIZE;
+    }
+    
+    // Calculate average text length (safe: total_segments > 0 guaranteed)
+    let avg_text_len: usize = segments.iter()
+        .map(|s| s.source_text.len())
+        .sum::<usize>() / total_segments;
+    
+    // Base chunk size on total segment count
+    let base_chunk_size = if total_segments < 100 {
+        MIN_CHUNK_SIZE
+    } else if total_segments < 500 {
+        TRANSLATION_CHUNK_SIZE
+    } else {
+        MAX_CHUNK_SIZE
+    };
+    
+    // Adjust based on text complexity
+    // Longer text = smaller chunks to avoid token limits
+    let adjusted_size = if avg_text_len > 200 {
+        // Long text (>200 chars avg): reduce chunk size by 30%
+        (base_chunk_size as f64 * 0.7) as usize
+    } else if avg_text_len > 100 {
+        // Medium text (100-200 chars): reduce by 15%
+        (base_chunk_size as f64 * 0.85) as usize
+    } else {
+        // Short text (<100 chars): keep base size
+        base_chunk_size
+    };
+    
+    // Clamp to min/max bounds
+    adjusted_size.clamp(MIN_CHUNK_SIZE, MAX_CHUNK_SIZE)
+}
+
+#[tauri::command]
+async fn translate_segments_with_gemini(
+    app: AppHandle,
+    state: State<'_, RunningProcesses>,
+    payload: GeminiTranslateRequest,
+) -> AppResult<TranslationResult> {
+    let all_segments = payload.segments;
+    let total_count = all_segments.len();
+
+    if total_count == 0 {
+        return Ok(TranslationResult {
+            segments: vec![],
+            token_usage: TokenUsage::default(),
+        });
+    }
+
+    // Calculate adaptive chunk size based on total segments and average text length
+    let chunk_size = calculate_adaptive_chunk_size(&all_segments);
+    
+    // Split segments into chunks
+    let chunks: Vec<&[SubtitleSegment]> = all_segments.chunks(chunk_size).collect();
+    let total_chunks = chunks.len();
+
+    eprintln!(
+        "[translate] {} segments → {} chunk(s) of ~{} each (adaptive)",
+        total_count, total_chunks, chunk_size
+    );
+
+    emit_progress(
+        &app,
+        &payload.job_id,
+        "translate",
+        70.0,
+        format!("Bắt đầu dịch {} phần...", total_chunks),
+        None,
+    );
+
+    // Register a cancel token for this Gemini job.
+    let cancel_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let mut tokens = state
+            .gemini_cancel_tokens
+            .lock()
+            ?;
+        tokens.insert(payload.job_id.clone(), Arc::clone(&cancel_token));
+    }
+
+    let mut translated_all: Vec<SubtitleSegment> = Vec::with_capacity(total_count);
+    let mut total_usage = TokenUsage::default();
+
+    for (chunk_idx, chunk) in chunks.iter().enumerate() {
+        // Check for cancellation before processing each chunk.
+        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
+            // Clean up cancel token.
+            {
+                let mut tokens = state
+                    .gemini_cancel_tokens
+                    .lock()
+                    ?;
+                tokens.remove(&payload.job_id);
+            }
+            return Err(AppError::cancelled("Job đã bị hủy bởi người dùng.", None));
+        }
+
+        // Build context from the tail of previously translated segments
+        let context_pairs: Vec<(String, String)> = if translated_all.is_empty() {
+            vec![]
+        } else {
+            let tail_count = translated_all.len().min(TRANSLATION_CONTEXT_SIZE);
+            translated_all[translated_all.len() - tail_count..]
+                .iter()
+                .map(|seg| (seg.source_text.clone(), seg.translated_text.clone()))
+                .collect()
+        };
+
+        // Progress: 70% → 95% spread across chunks
+        let progress = 70.0 + (chunk_idx as f64 / total_chunks as f64) * 25.0;
+        emit_progress(
+            &app,
+            &payload.job_id,
+            "translate",
+            progress,
+            format!(
+                "Đang dịch phần {}/{}... ({} segments)",
+                chunk_idx + 1,
+                total_chunks,
+                chunk.len()
+            ),
+            None,
+        );
+
+        match translate_chunk_with_retry(
+            &state.http_client,
+            &payload.api_key,
+            &payload.model_id,
+            &payload.translation_instruction,
+            chunk,
+            &context_pairs,
+            chunk_idx,
+            total_chunks,
+            0, // initial depth
+        )
+        .await
+        {
+            Ok((translated_chunk, chunk_usage)) => {
+                // Accumulate token usage
+                total_usage.accumulate(&chunk_usage);
+                
+                // Push Gemini's translated segments directly without mapping back to original IDs
+                // (SRT gốc và SRT dịch là hai phần riêng biệt, không cần đối chiếu)
+                for translated in translated_chunk.into_iter() {
+                    translated_all.push(SubtitleSegment {
+                        id: translated.id.clone(),
+                        start_ms: translated.start_ms,
+                        end_ms: translated.end_ms,
+                        source_text: String::new(), // SRT dịch không cần source_text
+                        translated_text: translated.source_text, // parse_srt puts text into source_text
+                    });
+                }
+            }
+            Err(error) => {
+                eprintln!(
+                    "[translate] Chunk {}/{} failed after retries: {}. Fallback cho chunk này.",
+                    chunk_idx + 1,
+                    total_chunks,
+                    error
+                );
+                // Fallback: copy sourceText for this chunk's segments only
+                let original_offset = chunk_idx * TRANSLATION_CHUNK_SIZE;
+                for (i, _seg) in chunk.iter().enumerate() {
+                    let original = &all_segments[original_offset + i];
+                    translated_all.push(SubtitleSegment {
+                        id: original.id.clone(),
+                        start_ms: original.start_ms,
+                        end_ms: original.end_ms,
+                        source_text: original.source_text.clone(),
+                        translated_text: original.source_text.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    // Final progress
+    emit_progress(
+        &app,
+        &payload.job_id,
+        "translate",
+        95.0,
+        "Hoàn tất dịch thuật.",
+        None,
+    );
+
+    // Clean up cancel token.
+    {
+        let mut tokens = state
+            .gemini_cancel_tokens
+            .lock()
+            ?;
+        tokens.remove(&payload.job_id);
+    }
+
+    Ok(TranslationResult {
+        segments: translated_all,
+        token_usage: total_usage,
+    })
+}
+
+fn chunk_audio(
+    app: &AppHandle,
+    source_path: &str,
+    track_index: u32,
+    job_id: &str,
+    duration: f64,
+) -> AppResult<Vec<(PathBuf, u64, u64)>> {
+    let cache_dir = app_cache_dir(app)?;
+    let chunks_dir = cache_dir.join("gemini-chunks").join(job_id);
+
+    // Reuse cached chunks if they exist and look valid.
+    if chunks_dir.exists() {
+        if let Ok(entries) = fs::read_dir(&chunks_dir) {
+            let existing: Vec<_> = entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.path()
+                        .extension()
+                        .map_or(false, |ext| ext == "mp3")
+                })
+                .collect();
+            if !existing.is_empty() {
+                let chunk_seconds = 20u64;
+                let total_seconds = duration.ceil() as u64;
+                let expected_count = (total_seconds + chunk_seconds - 1) / chunk_seconds;
+                if existing.len() as u64 >= expected_count {
+                    // Rebuild chunks list from cached files.
+                    let mut chunks = Vec::new();
+                    let mut offset = 0u64;
+                    while offset < total_seconds {
+                        let chunk_path = chunks_dir
+                            .join(format!("chunk-{}-{}.mp3", offset, offset + chunk_seconds));
+                        if chunk_path.exists() {
+                            chunks.push((
+                                chunk_path,
+                                offset * 1000,
+                                (offset + chunk_seconds).min(total_seconds) * 1000,
+                            ));
+                        }
+                        offset += chunk_seconds;
+                    }
+                    if !chunks.is_empty() {
+                        return Ok(chunks);
+                    }
+                }
+            }
+        }
+        // Invalid cache — clean and re-chunk.
+        let _ = fs::remove_dir_all(&chunks_dir);
+    }
+
+    fs::create_dir_all(&chunks_dir)?;
+
+    let ffmpeg = resolve_ffmpeg_path(app)?;
+    let track_map = format!("0:{}", track_index);
     let mut chunks = Vec::new();
     let chunk_seconds = 20u64;
     let total_seconds = duration.ceil() as u64;
@@ -1629,7 +2142,9 @@ fn chunk_audio(app: &AppHandle, audio_path: &str, duration: f64) -> Result<Vec<(
             .arg("-t")
             .arg(chunk_seconds.to_string())
             .arg("-i")
-            .arg(audio_path)
+            .arg(source_path)
+            .arg("-map")
+            .arg(&track_map)
             .arg("-vn")
             .arg("-acodec")
             .arg("libmp3lame")
@@ -1637,10 +2152,10 @@ fn chunk_audio(app: &AppHandle, audio_path: &str, duration: f64) -> Result<Vec<(
             .arg("160k")
             .arg(&output_path)
             .status()
-            .map_err(|error| error.to_string())?;
+            ?;
 
         if !status.success() {
-            return Err("Không thể chunk audio cho Gemini direct mode.".into());
+            return Err(AppError::media_processing("Không thể chunk audio cho Gemini direct mode.", None));
         }
 
         chunks.push((
@@ -1657,14 +2172,23 @@ fn chunk_audio(app: &AppHandle, audio_path: &str, duration: f64) -> Result<Vec<(
 #[tauri::command]
 async fn transcribe_direct_with_gemini(
     app: AppHandle,
+    state: State<'_, RunningProcesses>,
     payload: GeminiDirectRequest,
-) -> Result<Vec<SubtitleSegment>, String> {
-    let inspection = inspect_media(app.clone(), payload.audio_path.clone()).await?;
-    let chunks = chunk_audio(&app, &payload.audio_path, inspection.duration_seconds)?;
+) -> AppResult<TranslationResult> {
+    // Chunk audio directly from source — no intermediate WAV needed.
+    // Chunks are cached per job_id for retry reuse.
+    let chunks = chunk_audio(
+        &app,
+        &payload.audio_path,
+        payload.track_index,
+        &payload.job_id,
+        payload.duration_seconds,
+    )?;
     let mut segments = Vec::new();
+    let mut total_usage = TokenUsage::default();
 
     for (index, (chunk_path, start_ms, end_ms)) in chunks.into_iter().enumerate() {
-        let bytes = fs::read(&chunk_path).map_err(|error| error.to_string())?;
+        let bytes = fs::read(&chunk_path)?;
         let base64_audio = base64::engine::general_purpose::STANDARD.encode(bytes);
         let prompt = format!(
             "Bạn đang xử lý một chunk audio cho subtitle. Nguồn ngôn ngữ: {}. Instruction dịch: {}. Hãy trả về JSON object dạng {{\"source_text\":\"...\",\"translated_text\":\"...\"}}. Không thêm markdown.",
@@ -1691,9 +2215,14 @@ async fn transcribe_direct_with_gemini(
             }
         });
 
-        let response = call_gemini(&payload.api_key, &payload.model_id, body).await?;
+        let response = call_gemini(&state.http_client, &payload.api_key, &payload.model_id, body).await?;
+        
+        // Extract and accumulate token usage
+        let chunk_usage = extract_token_usage(&response);
+        total_usage.accumulate(&chunk_usage);
+        
         let text = extract_text_part(&response)?;
-        let parsed: Value = serde_json::from_str(&text).map_err(|error| error.to_string())?;
+        let parsed: Value = serde_json::from_str(&text)?;
 
         segments.push(SubtitleSegment {
             id: format!("segment-{}", index + 1),
@@ -1710,32 +2239,36 @@ async fn transcribe_direct_with_gemini(
         });
     }
 
-    Ok(segments)
+    Ok(TranslationResult {
+        segments,
+        token_usage: total_usage,
+    })
 }
 
 #[tauri::command]
-async fn fetch_supported_gemini_models(api_key: String) -> Result<Vec<GeminiModelOption>, String> {
+async fn fetch_supported_gemini_models(
+    state: State<'_, RunningProcesses>,
+    api_key: String,
+) -> AppResult<Vec<GeminiModelOption>> {
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models?key={}",
         api_key
     );
-    let response = reqwest::Client::new()
+    let response = state
+        .http_client
         .get(url)
         .send()
         .await
-        .map_err(|error| error.to_string())?;
+        ?;
 
     if !response.status().is_success() {
-        return Err(format!(
-            "Không lấy được Gemini models với status {}",
-            response.status()
-        ));
+        return Err(AppError::network(format!("Không lấy được Gemini models với status {}", response.status()), None, None));
     }
 
     let payload = response
         .json::<Value>()
         .await
-        .map_err(|error| error.to_string())?;
+        ?;
     let models = payload["models"]
         .as_array()
         .cloned()
@@ -1800,7 +2333,7 @@ async fn render_hard_subtitle(
     job_id: String,
     payload: RenderRequest,
     duration_seconds: f64,
-) -> Result<String, String> {
+) -> AppResult<String> {
     let segments = parse_srt(&payload.subtitle_content)?;
     let ass_path = app_cache_dir(&app)?.join("render-preview.ass");
     write_ass_file(&ass_path, &segments, &payload.style)?;
@@ -1833,7 +2366,7 @@ async fn render_hard_subtitle(
             &payload.output_path,
         ])
         .spawn()
-        .map_err(|error| error.to_string())?;
+        ?;
 
         
     register_running_process(&state, &job_id, child)?;
@@ -1881,7 +2414,7 @@ async fn render_hard_subtitle(
             }
             CommandEvent::Error(message) => {
                 let _ = take_running_process(&state, &job_id)?;
-                return Err(message);
+                return Err(AppError::media_processing(message, None));
             }
             CommandEvent::Terminated(payload) => {
                 let removed = take_running_process(&state, &job_id)?;
@@ -1891,24 +2424,24 @@ async fn render_hard_subtitle(
                         break;
                     }
                 } else if removed.is_none() {
-                    return Err("Job đã bị hủy bởi người dùng.".into());
+                    return Err(AppError::cancelled("Job đã bị hủy bởi người dùng.", None));
                 } else {
                     let ffmpeg_log = stderr_lines.join("\n");
-                    return Err(format!(
-                        "Render thất bại với code {:?}\n\n--- FFmpeg log ---\n{}",
-                        payload.code, ffmpeg_log
-                    ));
+                    return Err(AppError::media_processing(format!("Render thất bại với code {:?}\n\n--- FFmpeg log ---\n{}", payload.code, ffmpeg_log), None));
                 }
             }
             _ => {}
         }
     }
 
+    // Clean up temporary ASS subtitle file after render completes.
+    let _ = fs::remove_file(&ass_path);
+
     Ok(payload.output_path)
 }
 
 #[tauri::command]
-fn load_app_settings(app: AppHandle) -> Result<AppSettings, String> {
+fn load_app_settings(app: AppHandle) -> AppResult<AppSettings> {
     let path = settings_path(&app)?;
     if !path.exists() {
         return Ok(AppSettings {
@@ -1919,29 +2452,169 @@ fn load_app_settings(app: AppHandle) -> Result<AppSettings, String> {
         });
     }
     
-    let raw = fs::read(path).map_err(|error| error.to_string())?;
-    let settings: AppSettings = serde_json::from_slice(&raw).map_err(|error| error.to_string())?;
+    let raw = fs::read(path)?;
+    let settings: AppSettings = serde_json::from_slice(&raw)?;
     Ok(settings)
 }
 
-#[tauri::command]
-fn save_project_snapshot(path: String, snapshot: ProjectSnapshot) -> Result<(), String> {
-    let bytes = serde_json::to_vec_pretty(&snapshot).map_err(|error| error.to_string())?;
-    fs::write(path, bytes).map_err(|error| error.to_string())
+/// Write bytes to a file atomically: write to a temp file, then rename.
+/// Prevents data corruption if the app crashes mid-write.
+fn atomic_write(path: &std::path::Path, data: &[u8]) -> AppResult<()> {
+    let tmp_path = path.with_extension("tmp");
+    fs::write(&tmp_path, data).map_err(|e| AppError::file_system(format!("Ghi file tạm thất bại: {e}"), None))?;
+    fs::rename(&tmp_path, path).map_err(|e| AppError::file_system(format!("Rename file thất bại: {e}"), None))
 }
 
 #[tauri::command]
-fn load_project_snapshot(path: String) -> Result<ProjectSnapshot, String> {
-    let raw = fs::read(path).map_err(|error| error.to_string())?;
+fn save_project_snapshot(path: String, snapshot: ProjectSnapshot) -> AppResult<()> {
+    let bytes = serde_json::to_vec_pretty(&snapshot)?;
+    atomic_write(std::path::Path::new(&path), &bytes)
+}
+
+#[tauri::command]
+fn load_project_snapshot(path: String) -> AppResult<ProjectSnapshot> {
+    let raw = fs::read(path)?;
     let snapshot: ProjectSnapshot =
-        serde_json::from_slice(&raw).map_err(|error| error.to_string())?;
+        serde_json::from_slice(&raw)?;
     migrate_project_snapshot(snapshot)
 }
 
 #[tauri::command]
-fn persist_app_settings(app: AppHandle, settings: AppSettings) -> Result<(), String> {
-    let bytes = serde_json::to_vec_pretty(&settings).map_err(|error| error.to_string())?;
-    fs::write(settings_path(&app)?, bytes).map_err(|error| error.to_string())
+fn persist_app_settings(app: AppHandle, settings: AppSettings) -> AppResult<()> {
+    let bytes = serde_json::to_vec_pretty(&settings)?;
+    atomic_write(&settings_path(&app)?, &bytes)
+}
+
+#[tauri::command]
+fn cleanup_job_cache(app: AppHandle, job_id: String) -> AppResult<()> {
+    if let Ok(cache_dir) = app.path().app_cache_dir() {
+        // Remove cached whisper PCM file for this job.
+        let _ = fs::remove_file(cache_dir.join("whisper-pcm").join(format!("{job_id}.raw")));
+        // Remove cached gemini chunk directory for this job.
+        let _ = fs::remove_dir_all(cache_dir.join("gemini-chunks").join(&job_id));
+    }
+    Ok(())
+}
+
+/// Get total cache size in bytes
+#[tauri::command]
+fn get_cache_size(app: AppHandle) -> AppResult<u64> {
+    let cache_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| AppError::file_system(format!("Failed to get cache dir: {e}"), None))?;
+    
+    let mut total_size = 0u64;
+    
+    // Calculate size of whisper-pcm cache
+    if let Ok(entries) = fs::read_dir(cache_dir.join("whisper-pcm")) {
+        for entry in entries.flatten() {
+            if let Ok(metadata) = entry.metadata() {
+                total_size += metadata.len();
+            }
+        }
+    }
+    
+    // Calculate size of gemini-chunks cache
+    if let Ok(entries) = fs::read_dir(cache_dir.join("gemini-chunks")) {
+        for entry in entries.flatten() {
+            if let Ok(metadata) = entry.metadata() {
+                if metadata.is_dir() {
+                    total_size += calculate_dir_size(&entry.path()).unwrap_or(0);
+                }
+            }
+        }
+    }
+    
+    Ok(total_size)
+}
+
+/// Recursively calculate directory size
+fn calculate_dir_size(path: &Path) -> Result<u64, std::io::Error> {
+    let mut size = 0u64;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            size += calculate_dir_size(&entry.path())?;
+        } else {
+            size += metadata.len();
+        }
+    }
+    Ok(size)
+}
+
+/// Clean all cache files
+#[tauri::command]
+fn cleanup_all_cache(app: AppHandle) -> AppResult<()> {
+    let cache_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| AppError::file_system(format!("Failed to get cache dir: {e}"), None))?;
+    
+    // Remove all whisper PCM files
+    let _ = fs::remove_dir_all(cache_dir.join("whisper-pcm"));
+    let _ = fs::create_dir_all(cache_dir.join("whisper-pcm"));
+    
+    // Remove all gemini chunks
+    let _ = fs::remove_dir_all(cache_dir.join("gemini-chunks"));
+    let _ = fs::create_dir_all(cache_dir.join("gemini-chunks"));
+    
+    Ok(())
+}
+
+/// Clean old cache files based on access time
+#[tauri::command]
+fn cleanup_old_cache(app: AppHandle, days: u64) -> AppResult<u64> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    
+    let cache_dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| AppError::file_system(format!("Failed to get cache dir: {e}"), None))?;
+    
+    let cutoff_time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| AppError::unknown(format!("Time error: {e}")))?
+        .as_secs() - (days * 24 * 3600);
+    
+    let mut cleaned_bytes = 0u64;
+    
+    // Clean old whisper PCM files
+    if let Ok(entries) = fs::read_dir(cache_dir.join("whisper-pcm")) {
+        for entry in entries.flatten() {
+            if let Ok(metadata) = entry.metadata() {
+                if let Ok(accessed) = metadata.accessed() {
+                    if let Ok(duration) = accessed.duration_since(UNIX_EPOCH) {
+                        if duration.as_secs() < cutoff_time {
+                            cleaned_bytes += metadata.len();
+                            let _ = fs::remove_file(entry.path());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // Clean old gemini chunk directories
+    if let Ok(entries) = fs::read_dir(cache_dir.join("gemini-chunks")) {
+        for entry in entries.flatten() {
+            if let Ok(metadata) = entry.metadata() {
+                if metadata.is_dir() {
+                    if let Ok(accessed) = metadata.accessed() {
+                        if let Ok(duration) = accessed.duration_since(UNIX_EPOCH) {
+                            if duration.as_secs() < cutoff_time {
+                                cleaned_bytes += calculate_dir_size(&entry.path()).unwrap_or(0);
+                                let _ = fs::remove_dir_all(entry.path());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    Ok(cleaned_bytes)
 }
 
 #[tauri::command]
@@ -1949,10 +2622,10 @@ fn cancel_pipeline_process(
     app: AppHandle,
     state: State<'_, RunningProcesses>,
     job_id: String,
-) -> Result<(), String> {
+) -> AppResult<()> {
     // Cancel ffmpeg/sidecar processes.
     if let Some(child) = take_running_process(&state, &job_id)? {
-        child.kill().map_err(|error| error.to_string())?;
+        child.kill()?;
     }
 
     // Cancel whisper-rs jobs via AtomicBool token.
@@ -1960,7 +2633,18 @@ fn cancel_pipeline_process(
         let mut tokens = state
             .whisper_cancel_tokens
             .lock()
-            .map_err(|_| "Không khóa được cancel tokens.".to_string())?;
+            ?;
+        if let Some(token) = tokens.remove(&job_id) {
+            token.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    // Cancel Gemini translation jobs via AtomicBool token.
+    {
+        let mut tokens = state
+            .gemini_cancel_tokens
+            .lock()
+            ?;
         if let Some(token) = tokens.remove(&job_id) {
             token.store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -1984,6 +2668,143 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
         .manage(RunningProcesses::default())
+        .register_uri_scheme_protocol("stream", |_ctx, request| {
+            let uri = request.uri().to_string();
+            // Parse path from stream://localhost/<encoded_path>
+            let path = uri
+                .strip_prefix("stream://localhost/")
+                .or_else(|| uri.strip_prefix("stream://localhost"))
+                .unwrap_or("");
+            let path = percent_encoding::percent_decode_str(path)
+                .decode_utf8_lossy()
+                .to_string();
+
+            let file_path = std::path::Path::new(&path);
+            if !file_path.exists() {
+                return HttpResponse::builder()
+                    .status(404)
+                    .body(Vec::new())
+                    .unwrap();
+            }
+
+            let file_size = match fs::metadata(&path) {
+                Ok(m) => m.len(),
+                Err(_) => {
+                    return HttpResponse::builder()
+                        .status(500)
+                        .body(Vec::new())
+                        .unwrap();
+                }
+            };
+
+            // Determine MIME type from extension
+            let mime = match file_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase())
+                .as_deref()
+            {
+                Some("mp4") => "video/mp4",
+                Some("webm") => "video/webm",
+                Some("mkv") => "video/x-matroska",
+                Some("avi") => "video/x-msvideo",
+                Some("mov") => "video/quicktime",
+                Some("m4v") => "video/x-m4v",
+                _ => "application/octet-stream",
+            };
+
+            // Parse Range header
+            let range_header = request.headers().get("range").and_then(|v| v.to_str().ok());
+
+            if let Some(range_str) = range_header {
+                // Parse "bytes=START-END" or "bytes=START-"
+                let range_str = range_str.trim_start_matches("bytes=");
+                let parts: Vec<&str> = range_str.splitn(2, '-').collect();
+                let start: u64 = parts[0].parse().unwrap_or(0);
+                let end: u64 = if parts.len() > 1 && !parts[1].is_empty() {
+                    parts[1].parse().unwrap_or(file_size - 1)
+                } else {
+                    // Limit chunk to STREAM_CHUNK_SIZE for large files to avoid memory issues
+                    std::cmp::min(start + STREAM_CHUNK_SIZE - 1, file_size - 1)
+                };
+                let end = std::cmp::min(end, file_size - 1);
+                let content_length = end - start + 1;
+
+                let mut file = match fs::File::open(&path) {
+                    Ok(f) => f,
+                    Err(_) => {
+                        return HttpResponse::builder()
+                            .status(500)
+                            .body(Vec::new())
+                            .unwrap();
+                    }
+                };
+
+                if file.seek(SeekFrom::Start(start)).is_err() {
+                    return HttpResponse::builder()
+                        .status(500)
+                        .body(Vec::new())
+                        .unwrap();
+                }
+
+                let mut buf = vec![0u8; content_length as usize];
+                if let Err(_) = file.read_exact(&mut buf) {
+                    // Read as much as possible
+                    let _ = file.seek(SeekFrom::Start(start));
+                    buf.resize(content_length as usize, 0);
+                    let _ = file.read(&mut buf);
+                }
+
+                HttpResponse::builder()
+                    .status(206)
+                    .header("Content-Type", mime)
+                    .header("Content-Length", content_length.to_string())
+                    .header(
+                        "Content-Range",
+                        format!("bytes {}-{}/{}", start, end, file_size),
+                    )
+                    .header("Accept-Ranges", "bytes")
+                    .header("Access-Control-Allow-Origin", "*")
+                    .body(buf)
+                    .unwrap()
+            } else {
+                // No Range header — return the first chunk as 206 Partial Content
+                // to force the browser to follow up with proper Range requests.
+                // This avoids reading entire multi-GB files into memory.
+                let end = std::cmp::min(STREAM_CHUNK_SIZE - 1, file_size - 1);
+                let content_length = end + 1;
+
+                let mut file = match fs::File::open(&path) {
+                    Ok(f) => f,
+                    Err(_) => {
+                        return HttpResponse::builder()
+                            .status(500)
+                            .body(Vec::new())
+                            .unwrap();
+                    }
+                };
+
+                let mut buf = vec![0u8; content_length as usize];
+                if let Err(_) = file.read_exact(&mut buf) {
+                    buf.clear();
+                    let _ = file.seek(SeekFrom::Start(0));
+                    let _ = file.read_to_end(&mut buf);
+                }
+
+                HttpResponse::builder()
+                    .status(206)
+                    .header("Content-Type", mime)
+                    .header("Content-Length", content_length.to_string())
+                    .header(
+                        "Content-Range",
+                        format!("bytes 0-{}/{}", end, file_size),
+                    )
+                    .header("Accept-Ranges", "bytes")
+                    .header("Access-Control-Allow-Origin", "*")
+                    .body(buf)
+                    .unwrap()
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             detect_runtime_capabilities,
             install_local_ffmpeg_runtime,
@@ -1992,7 +2813,6 @@ pub fn run() {
             download_whisper_model,
             remove_whisper_model,
             inspect_media,
-            normalize_audio,
             transcribe_with_whisper,
             translate_segments_with_gemini,
             transcribe_direct_with_gemini,
@@ -2003,6 +2823,10 @@ pub fn run() {
             save_project_snapshot,
             load_project_snapshot,
             persist_app_settings,
+            cleanup_job_cache,
+            get_cache_size,
+            cleanup_all_cache,
+            cleanup_old_cache,
             cancel_pipeline_process
         ])
         .run(tauri::generate_context!())
