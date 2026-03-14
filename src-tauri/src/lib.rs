@@ -1,16 +1,15 @@
 mod error;
+mod models;
 
 use base64::Engine;
 use error::{AppError, AppResult};
-use serde::{Deserialize, Serialize};
+use models::*;
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tauri::http::Response as HttpResponse;
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_shell::{
@@ -24,298 +23,11 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 
 // ==================== CONSTANTS ====================
 
-// Gemini API configuration
-const GEMINI_MODELS_ALLOWLIST: &[&str] = &[
-    "gemini-3.1-flash-lite-preview",
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-flash",
-    "gemini-3-flash-preview",
-];
-
-/// Number of subtitle segments per translation chunk.
-const TRANSLATION_CHUNK_SIZE: usize = 300;
-/// Minimum chunk size for adaptive chunking.
-const MIN_CHUNK_SIZE: usize = 50;
-/// Maximum chunk size for adaptive chunking.
-const MAX_CHUNK_SIZE: usize = 500;
-/// Number of previously-translated segments sent as context for continuity.
-const TRANSLATION_CONTEXT_SIZE: usize = 20;
-/// Maximum retry depth when splitting an oversized chunk in half.
-const MAX_CHUNK_SPLIT_DEPTH: usize = 2;
-/// Audio chunk duration for Gemini direct mode (seconds).
-const GEMINI_AUDIO_CHUNK_DURATION_SECS: f64 = 20.0;
-
 // Stream protocol configuration
 /// Stream chunk size for video streaming (2MB).
 const STREAM_CHUNK_SIZE: u64 = 2 * 1024 * 1024;
 
-// ==================== DATA STRUCTURES ====================
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct AudioTrackInfo {
-    index: i64,
-    codec: String,
-    channels: u64,
-    language: Option<String>,
-    title: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct MediaInspection {
-    path: String,
-    kind: String,
-    duration_seconds: f64,
-    file_size_bytes: u64,
-    audio_tracks: Vec<AudioTrackInfo>,
-    sample_rate: Option<u64>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct WhisperModelOption {
-    id: String,
-    label: String,
-    filename: String,
-    size_bytes: u64,
-    description: String,
-    downloaded: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GeminiModelOption {
-    id: String,
-    label: String,
-    description: String,
-    experimental: Option<bool>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct SubtitleSegment {
-    id: String,
-    start_ms: u64,
-    end_ms: u64,
-    source_text: String,
-    translated_text: String,
-}
-
-/// Token usage statistics from Gemini API calls.
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
-#[serde(rename_all = "camelCase")]
-struct TokenUsage {
-    prompt_tokens: u64,
-    completion_tokens: u64,
-    total_tokens: u64,
-}
-
-impl TokenUsage {
-    /// Accumulate tokens from another TokenUsage.
-    fn accumulate(&mut self, other: &TokenUsage) {
-        self.prompt_tokens += other.prompt_tokens;
-        self.completion_tokens += other.completion_tokens;
-        self.total_tokens += other.total_tokens;
-    }
-}
-
-/// Translation result containing segments and token usage.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TranslationResult {
-    segments: Vec<SubtitleSegment>,
-    token_usage: TokenUsage,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RuntimeCapabilities {
-    os: String,
-    ffmpeg_available: bool,
-    ffprobe_available: bool,
-    local_ffmpeg_installed: bool,
-    local_ffprobe_installed: bool,
-    hardware_acceleration_available: bool,
-    detected_accelerators: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-struct AppSettings {
-    api_key: String,
-    output_directory: String,
-    last_opened_project_path: String,
-    saved_translation_instruction: String,
-}
-
-impl Default for AppSettings {
-    fn default() -> Self {
-        Self {
-            api_key: String::new(),
-            output_directory: String::new(),
-            last_opened_project_path: String::new(),
-            saved_translation_instruction: String::new(),
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ProjectSnapshot {
-    version: u32,
-    exported_at: String,
-    job: Value,
-}
-
-#[derive(Debug, Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct PipelineProgressEvent {
-    job_id: String,
-    phase: String,
-    progress: f64,
-    message: String,
-    eta_seconds: Option<u64>,
-}
-
-#[derive(Debug, Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct ModelDownloadProgressEvent {
-    model_id: String,
-    progress: u64,
-    downloaded_bytes: u64,
-    total_bytes: u64,
-}
-
-#[derive(Debug, Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct RuntimeDownloadProgressEvent {
-    stage: String,
-    progress: u64,
-    downloaded_bytes: u64,
-    total_bytes: u64,
-    message: String,
-}
-
-struct RunningProcesses {
-    jobs: Mutex<HashMap<String, CommandChild>>,
-    /// Cancel tokens for Whisper transcription jobs (checked during inference and segment reading).
-    whisper_cancel_tokens: Mutex<HashMap<String, Arc<AtomicBool>>>,
-    /// Cancel tokens for Gemini translation jobs (checked between chunks).
-    gemini_cancel_tokens: Mutex<HashMap<String, Arc<AtomicBool>>>,
-    /// Cached WhisperContext to avoid reloading the model on every transcription.
-    /// Tuple: (model_path, use_gpu, context).
-    whisper_ctx_cache: Mutex<Option<(String, bool, Arc<WhisperContext>)>>,
-    /// Shared HTTP client for Gemini API calls (reuses connections/TLS sessions).
-    http_client: reqwest::Client,
-}
-
-impl Default for RunningProcesses {
-    fn default() -> Self {
-        Self {
-            jobs: Mutex::default(),
-            whisper_cancel_tokens: Mutex::default(),
-            gemini_cancel_tokens: Mutex::default(),
-            whisper_ctx_cache: Mutex::new(None),
-            http_client: reqwest::Client::new(),
-        }
-    }
-}
-
-fn migrate_project_snapshot(snapshot: ProjectSnapshot) -> AppResult<ProjectSnapshot> {
-    match snapshot.version {
-        1 => Ok(snapshot),
-        _ => Err(AppError::validation("Project schema version hiện chưa được hỗ trợ để migrate.", None)),
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct WhisperRequest {
-    audio_path: String,
-    track_index: u32,
-    source_language: String,
-    model_id: String,
-    compute_mode: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GeminiTranslateRequest {
-    job_id: String,
-    api_key: String,
-    model_id: String,
-    translation_instruction: String,
-    segments: Vec<SubtitleSegment>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GeminiDirectRequest {
-    job_id: String,
-    api_key: String,
-    model_id: String,
-    audio_path: String,
-    track_index: u32,
-    duration_seconds: f64,
-    source_language: String,
-    translation_instruction: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RenderStyle {
-    font_family: String,
-    font_size: u64,
-    text_color: String,
-    outline_color: String,
-    outline_width: u64,
-    background_color: String,
-    line_spacing: u64,
-    margin_x: u64,
-    margin_y: u64,
-    bold: bool,
-    italic: bool,
-    position: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RenderRequest {
-    input_path: String,
-    output_path: String,
-    subtitle_content: String,
-    style: RenderStyle,
-}
-
-fn whisper_model_catalog() -> Vec<(String, String, String, u64, String, String)> {
-    vec![
-        (
-            "small".into(),
-            "small".into(),
-            "ggml-small.bin".into(),
-            488 * 1024 * 1024,
-            "Độ chính xác cao hơn với chi phí inference lớn hơn.".into(),
-            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin".into(),
-        ),
-        (
-            "medium".into(),
-            "medium".into(),
-            "ggml-medium.bin".into(),
-            1_530 * 1024 * 1024,
-            "Phù hợp media dài hoặc âm thanh khó.".into(),
-            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin".into(),
-        ),
-        (
-            "large".into(),
-            "large".into(),
-            "ggml-large-v3.bin".into(),
-            3_090 * 1024 * 1024,
-            "Chất lượng tốt nhất nhưng đòi hỏi tài nguyên cao.".into(),
-            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin".into(),
-        ),
-    ]
-}
+// ==================== HELPER FUNCTIONS ====================
 
 fn app_data_dir(app: &AppHandle) -> AppResult<PathBuf> {
     let dir = app
@@ -1150,6 +862,7 @@ fn remove_whisper_model(app: AppHandle, model_id: String) -> AppResult<WhisperMo
 
 #[tauri::command]
 async fn inspect_media(app: AppHandle, file_path: String) -> AppResult<MediaInspection> {
+    log::info!("[media] Inspecting media file: {}", file_path);
     let ffprobe = resolve_ffprobe_path(&app)?;
     let output = app
         .shell()
@@ -1223,14 +936,23 @@ async fn inspect_media(app: AppHandle, file_path: String) -> AppResult<MediaInsp
         .and_then(|stream| stream["sample_rate"].as_str())
         .and_then(|value| value.parse::<u64>().ok());
 
-    Ok(MediaInspection {
-        path: file_path,
+    let inspection = MediaInspection {
+        path: file_path.clone(),
         kind: kind.to_string(),
         duration_seconds,
         file_size_bytes,
-        audio_tracks,
+        audio_tracks: audio_tracks.clone(),
         sample_rate,
-     })
+    };
+    
+    log::info!(
+        "[media] Inspected {}: {:.1}s, {} audio tracks",
+        file_path,
+        duration_seconds,
+        audio_tracks.len()
+    );
+    
+    Ok(inspection)
 }
 
 #[tauri::command]
@@ -1240,6 +962,15 @@ async fn transcribe_with_whisper(
     job_id: String,
     payload: WhisperRequest,
 ) -> AppResult<Vec<SubtitleSegment>> {
+    let start = std::time::Instant::now();
+    
+    log::info!(
+        "[whisper] Starting transcription: job_id={}, model={}, compute={}",
+        job_id,
+        payload.model_id,
+        payload.compute_mode
+    );
+    
     let model = whisper_model_catalog()
         .into_iter()
         .find(|(id, _, _, _, _, _)| id == &payload.model_id)
@@ -1479,6 +1210,12 @@ async fn transcribe_with_whisper(
 
     match result {
         Ok(segments) => {
+            let elapsed = start.elapsed();
+            log::info!(
+                "[whisper] Transcription complete: {} segments in {:.1}s",
+                segments.len(),
+                elapsed.as_secs_f64()
+            );
             emit_progress(
                 &app,
                 &job_id,
@@ -1489,7 +1226,10 @@ async fn transcribe_with_whisper(
             );
             Ok(segments)
         }
-        Err(error) => Err(error),
+        Err(error) => {
+            log::error!("[whisper] Transcription failed: {}", error);
+            Err(error)
+        }
     }
 }
 
@@ -1630,23 +1370,89 @@ async fn call_gemini(
     body: Value,
 ) -> AppResult<Value> {
     let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-        model_id, api_key
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
+        model_id
     );
-    let response = client
-        .post(url)
-        .json(&body)
-        .send()
-        .await
-        ?;
-
-    if !response.status().is_success() {
-        return Err(AppError::network(format!("Gemini request thất bại với status {}", response.status()), None, None));
+    
+    log::debug!("[gemini] API call: model={}", model_id);
+    let start = std::time::Instant::now();
+    
+    let mut last_error = None;
+    
+    for attempt in 0..=MAX_GEMINI_RETRIES {
+        // Apply exponential backoff with jitter (except for first attempt)
+        if attempt > 0 {
+            let backoff = GEMINI_INITIAL_BACKOFF_MS * 2u64.pow(attempt - 1);
+            // Add jitter: ±25%
+            let jitter_factor = 0.25 * (rand::random::<f64>() * 2.0 - 1.0);
+            let jittered_backoff = (backoff as f64 * (1.0 + jitter_factor)) as u64;
+            
+            log::warn!(
+                "[gemini] Retry {}/{} after {}ms...",
+                attempt, MAX_GEMINI_RETRIES, jittered_backoff
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(jittered_backoff)).await;
+        }
+        
+        // Make the request
+        let url_with_key = format!("{}?key={}", url, api_key);
+        let response = match client
+            .post(&url_with_key)
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) if e.is_timeout() || e.is_connect() => {
+                let err_msg = format!("Network error: {}", e);
+                log::warn!("[gemini] Attempt {}: {}", attempt + 1, err_msg);
+                last_error = Some(AppError::network(err_msg, None, None));
+                continue;
+            }
+            Err(e) => {
+                return Err(AppError::network(format!("Request failed: {}", e), None, None));
+            }
+        };
+        
+        let status = response.status();
+        
+        // Success case
+        if status.is_success() {
+            let elapsed = start.elapsed();
+            log::debug!("[gemini] API call success: {}ms", elapsed.as_millis());
+            return response
+                .json::<Value>()
+                .await
+                .map_err(|e| AppError::network(format!("Failed to parse response: {}", e), None, None));
+        }
+        
+        // Retryable status codes
+        match status.as_u16() {
+            429 | 500 | 502 | 503 | 529 => {
+                let err_msg = format!("Gemini API returned status {}", status);
+                log::warn!("[gemini] Attempt {}: {}", attempt + 1, err_msg);
+                last_error = Some(AppError::network(err_msg, None, None));
+                continue;
+            }
+            _ => {
+                // Non-retryable error
+                return Err(AppError::network(
+                    format!("Gemini request failed with status {}", status),
+                    None,
+                    None,
+                ));
+            }
+        }
     }
-
-    Ok(response
-        .json::<Value>()
-        .await?)
+    
+    // All retries exhausted
+    Err(last_error.unwrap_or_else(|| {
+        AppError::network(
+            format!("Gemini request failed after {} retries", MAX_GEMINI_RETRIES),
+            None,
+            None,
+        )
+    }))
 }
 
 /// Build a context-aware SRT string for a translation chunk.
@@ -1743,17 +1549,58 @@ async fn translate_single_chunk(
     let srt_text = strip_markdown_code_block(&raw_text);
     let translated = parse_srt(srt_text)?;
 
-    if translated.len() != expected_count {
-        eprintln!(
-            "[translate] Chunk {}/{}: segment count differs (expected {}, got {}). Accepting as-is.",
+    // Reconcile segment count mismatch by mapping to original timing
+    let final_segments = if translated.len() == expected_count {
+        // Perfect match - use Gemini's output as-is
+        translated
+    } else {
+        log::warn!(
+            "[translate] Chunk {}/{}: segment count mismatch (expected {}, got {}). Reconciling with original timing...",
             chunk_idx + 1,
             total_chunks,
             expected_count,
             translated.len()
         );
-    }
+        
+        let mut reconciled = Vec::with_capacity(expected_count);
+        for (i, original) in chunk.iter().enumerate() {
+            // Use Gemini's translation if available, otherwise copy source text
+            let translated_text = translated.get(i)
+                .map(|t| t.source_text.clone()) // parse_srt puts text into source_text field
+                .unwrap_or_else(|| {
+                    log::warn!(
+                        "[translate] Chunk {}/{}: Missing translation for segment {} ({}..{}ms), using source text as fallback",
+                        chunk_idx + 1,
+                        total_chunks,
+                        i + 1,
+                        original.start_ms,
+                        original.end_ms
+                    );
+                    original.source_text.clone()
+                });
+            
+            reconciled.push(SubtitleSegment {
+                id: original.id.clone(),
+                start_ms: original.start_ms,
+                end_ms: original.end_ms,
+                source_text: translated_text,
+                translated_text: String::new(), // Will be used downstream
+            });
+        }
+        
+        if translated.len() > expected_count {
+            log::warn!(
+                "[translate] Chunk {}/{}: Gemini returned {} extra segments, ignoring them.",
+                chunk_idx + 1,
+                total_chunks,
+                translated.len() - expected_count
+            );
+        }
+        
+        reconciled
+    };
 
-    Ok((translated, token_usage))
+    Ok((final_segments, token_usage))
 }
 
 /// Translate a chunk with adaptive retry: on failure, split in half and retry each sub-chunk.
@@ -1786,7 +1633,7 @@ fn translate_chunk_with_retry<'a>(
     {
         Ok((segments, token_usage)) => return Ok((segments, token_usage)),
         Err(error) => {
-            eprintln!(
+            log::warn!(
                 "[translate] Chunk {}/{} failed (depth {}): {}",
                 chunk_idx + 1,
                 total_chunks,
@@ -1799,7 +1646,7 @@ fn translate_chunk_with_retry<'a>(
                 let mid = chunk.len() / 2;
                 let (first_half, second_half) = chunk.split_at(mid);
 
-                eprintln!(
+                log::info!(
                     "[translate] Splitting chunk into {} + {} segments (depth {})",
                     first_half.len(),
                     second_half.len(),
@@ -1901,7 +1748,16 @@ fn calculate_adaptive_chunk_size(segments: &[SubtitleSegment]) -> usize {
     };
     
     // Clamp to min/max bounds
-    adjusted_size.clamp(MIN_CHUNK_SIZE, MAX_CHUNK_SIZE)
+    let final_size = adjusted_size.clamp(MIN_CHUNK_SIZE, MAX_CHUNK_SIZE);
+    
+    log::debug!(
+        "[translate] Adaptive chunk size: {} segments, avg_len={}, chunk_size={}",
+        total_segments,
+        avg_text_len,
+        final_size
+    );
+    
+    final_size
 }
 
 #[tauri::command]
@@ -1910,8 +1766,16 @@ async fn translate_segments_with_gemini(
     state: State<'_, RunningProcesses>,
     payload: GeminiTranslateRequest,
 ) -> AppResult<TranslationResult> {
+    let start = std::time::Instant::now();
     let all_segments = payload.segments;
     let total_count = all_segments.len();
+    
+    log::info!(
+        "[translate] Starting translation: job_id={}, model={}, {} segments",
+        payload.job_id,
+        payload.model_id,
+        total_count
+    );
 
     if total_count == 0 {
         return Ok(TranslationResult {
@@ -1927,7 +1791,7 @@ async fn translate_segments_with_gemini(
     let chunks: Vec<&[SubtitleSegment]> = all_segments.chunks(chunk_size).collect();
     let total_chunks = chunks.len();
 
-    eprintln!(
+    log::info!(
         "[translate] {} segments → {} chunk(s) of ~{} each (adaptive)",
         total_count, total_chunks, chunk_size
     );
@@ -2025,14 +1889,14 @@ async fn translate_segments_with_gemini(
                 }
             }
             Err(error) => {
-                eprintln!(
+                log::error!(
                     "[translate] Chunk {}/{} failed after retries: {}. Fallback cho chunk này.",
                     chunk_idx + 1,
                     total_chunks,
                     error
                 );
                 // Fallback: copy sourceText for this chunk's segments only
-                let original_offset = chunk_idx * TRANSLATION_CHUNK_SIZE;
+                let original_offset = chunk_idx * chunk_size;
                 for (i, _seg) in chunk.iter().enumerate() {
                     let original = &all_segments[original_offset + i];
                     translated_all.push(SubtitleSegment {
@@ -2065,6 +1929,14 @@ async fn translate_segments_with_gemini(
             ?;
         tokens.remove(&payload.job_id);
     }
+    
+    let elapsed = start.elapsed();
+    log::info!(
+        "[translate] Translation complete: {} segments, {} total tokens in {:.1}s",
+        translated_all.len(),
+        total_usage.total_tokens,
+        elapsed.as_secs_f64()
+    );
 
     Ok(TranslationResult {
         segments: translated_all,
@@ -2094,7 +1966,7 @@ fn chunk_audio(
                 })
                 .collect();
             if !existing.is_empty() {
-                let chunk_seconds = 20u64;
+                let chunk_seconds = GEMINI_AUDIO_CHUNK_DURATION_SECS as u64;
                 let total_seconds = duration.ceil() as u64;
                 let expected_count = (total_seconds + chunk_seconds - 1) / chunk_seconds;
                 if existing.len() as u64 >= expected_count {
@@ -2114,6 +1986,7 @@ fn chunk_audio(
                         offset += chunk_seconds;
                     }
                     if !chunks.is_empty() {
+                        log::debug!("[chunk_audio] Cache hit: {} chunks for job {}", chunks.len(), job_id);
                         return Ok(chunks);
                     }
                 }
@@ -2128,7 +2001,7 @@ fn chunk_audio(
     let ffmpeg = resolve_ffmpeg_path(app)?;
     let track_map = format!("0:{}", track_index);
     let mut chunks = Vec::new();
-    let chunk_seconds = 20u64;
+    let chunk_seconds = GEMINI_AUDIO_CHUNK_DURATION_SECS as u64;
     let total_seconds = duration.ceil() as u64;
     let mut offset = 0u64;
 
@@ -2165,6 +2038,8 @@ fn chunk_audio(
         ));
         offset += chunk_seconds;
     }
+    
+    log::debug!("[chunk_audio] Created {} audio chunks for job {}", chunks.len(), job_id);
 
     Ok(chunks)
 }
@@ -2175,6 +2050,15 @@ async fn transcribe_direct_with_gemini(
     state: State<'_, RunningProcesses>,
     payload: GeminiDirectRequest,
 ) -> AppResult<TranslationResult> {
+    let start = std::time::Instant::now();
+    
+    log::info!(
+        "[gemini-direct] Starting direct transcription: job_id={}, model={}, audio={}",
+        payload.job_id,
+        payload.model_id,
+        payload.audio_path
+    );
+    
     // Chunk audio directly from source — no intermediate WAV needed.
     // Chunks are cached per job_id for retry reuse.
     let chunks = chunk_audio(
@@ -2184,10 +2068,36 @@ async fn transcribe_direct_with_gemini(
         &payload.job_id,
         payload.duration_seconds,
     )?;
+    
+    log::debug!("[gemini-direct] Audio chunked into {} segments", chunks.len());
+    
+    // Register a cancel token for this Gemini job.
+    let cancel_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let mut tokens = state
+            .gemini_cancel_tokens
+            .lock()
+            ?;
+        tokens.insert(payload.job_id.clone(), Arc::clone(&cancel_token));
+    }
+    
     let mut segments = Vec::new();
     let mut total_usage = TokenUsage::default();
 
     for (index, (chunk_path, start_ms, end_ms)) in chunks.into_iter().enumerate() {
+        // Check for cancellation before processing each chunk.
+        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
+            // Clean up cancel token.
+            {
+                let mut tokens = state
+                    .gemini_cancel_tokens
+                    .lock()
+                    ?;
+                tokens.remove(&payload.job_id);
+            }
+            return Err(AppError::cancelled("Job đã bị hủy bởi người dùng.", None));
+        }
+        
         let bytes = fs::read(&chunk_path)?;
         let base64_audio = base64::engine::general_purpose::STANDARD.encode(bytes);
         let prompt = format!(
@@ -2215,29 +2125,109 @@ async fn transcribe_direct_with_gemini(
             }
         });
 
-        let response = call_gemini(&state.http_client, &payload.api_key, &payload.model_id, body).await?;
+        // Try processing this chunk with retry logic for JSON parse failures
+        const MAX_CHUNK_RETRIES: u32 = 2;
+        let mut chunk_result = None;
+        let mut last_error = None;
         
-        // Extract and accumulate token usage
-        let chunk_usage = extract_token_usage(&response);
-        total_usage.accumulate(&chunk_usage);
+        for chunk_attempt in 0..=MAX_CHUNK_RETRIES {
+            if chunk_attempt > 0 {
+                log::info!(
+                    "[gemini-direct] Chunk {} retry {}/{}...",
+                    index + 1, chunk_attempt, MAX_CHUNK_RETRIES
+                );
+            }
+            
+            match call_gemini(&state.http_client, &payload.api_key, &payload.model_id, body.clone()).await {
+                Ok(response) => {
+                    // Extract and accumulate token usage
+                    let chunk_usage = extract_token_usage(&response);
+                    
+                    // Try to parse the response
+                    match extract_text_part(&response) {
+                        Ok(text) => {
+                            match serde_json::from_str::<Value>(&text) {
+                                Ok(parsed) => {
+                                    total_usage.accumulate(&chunk_usage);
+                                    chunk_result = Some((parsed, start_ms, end_ms));
+                                    break;
+                                }
+                                Err(e) => {
+                                    let err_msg = format!("JSON parse error: {}", e);
+                                    log::warn!("[gemini-direct] Chunk {} attempt {}: {}", index + 1, chunk_attempt + 1, err_msg);
+                                    last_error = Some(err_msg);
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let err_msg = format!("Failed to extract text: {}", e);
+                            log::warn!("[gemini-direct] Chunk {} attempt {}: {}", index + 1, chunk_attempt + 1, err_msg);
+                            last_error = Some(err_msg);
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let err_msg = format!("API call failed: {}", e);
+                    log::warn!("[gemini-direct] Chunk {} attempt {}: {}", index + 1, chunk_attempt + 1, err_msg);
+                    last_error = Some(err_msg);
+                    continue;
+                }
+            }
+        }
         
-        let text = extract_text_part(&response)?;
-        let parsed: Value = serde_json::from_str(&text)?;
-
-        segments.push(SubtitleSegment {
-            id: format!("segment-{}", index + 1),
-            start_ms,
-            end_ms,
-            source_text: parsed["source_text"]
-                .as_str()
-                .unwrap_or("Transcription unavailable")
-                .to_string(),
-            translated_text: parsed["translated_text"]
-                .as_str()
-                .unwrap_or("Translation unavailable")
-                .to_string(),
-        });
+        // Process the result or insert fallback
+        match chunk_result {
+            Some((parsed, start_ms, end_ms)) => {
+                segments.push(SubtitleSegment {
+                    id: format!("segment-{}", index + 1),
+                    start_ms,
+                    end_ms,
+                    source_text: parsed["source_text"]
+                        .as_str()
+                        .unwrap_or("Transcription unavailable")
+                        .to_string(),
+                    translated_text: parsed["translated_text"]
+                        .as_str()
+                        .unwrap_or("Translation unavailable")
+                        .to_string(),
+                });
+            }
+            None => {
+                log::error!(
+                    "[gemini-direct] Chunk {} failed after {} retries. Using fallback. Last error: {}",
+                    index + 1,
+                    MAX_CHUNK_RETRIES,
+                    last_error.unwrap_or_else(|| "Unknown error".to_string())
+                );
+                segments.push(SubtitleSegment {
+                    id: format!("segment-{}", index + 1),
+                    start_ms,
+                    end_ms,
+                    source_text: "[Transcription failed]".to_string(),
+                    translated_text: "[Translation failed]".to_string(),
+                });
+            }
+        }
     }
+
+    // Clean up cancel token.
+    {
+        let mut tokens = state
+            .gemini_cancel_tokens
+            .lock()
+            ?;
+        tokens.remove(&payload.job_id);
+    }
+    
+    let elapsed = start.elapsed();
+    log::info!(
+        "[gemini-direct] Direct transcription complete: {} segments, {} total tokens in {:.1}s",
+        segments.len(),
+        total_usage.total_tokens,
+        elapsed.as_secs_f64()
+    );
 
     Ok(TranslationResult {
         segments,
@@ -2334,6 +2324,14 @@ async fn render_hard_subtitle(
     payload: RenderRequest,
     duration_seconds: f64,
 ) -> AppResult<String> {
+    let start = std::time::Instant::now();
+    
+    log::info!(
+        "[render] Starting hard subtitle render: input={}, output={}",
+        payload.input_path,
+        payload.output_path
+    );
+    
     let segments = parse_srt(&payload.subtitle_content)?;
     let ass_path = app_cache_dir(&app)?.join("render-preview.ass");
     write_ass_file(&ass_path, &segments, &payload.style)?;
@@ -2416,18 +2414,26 @@ async fn render_hard_subtitle(
                 let _ = take_running_process(&state, &job_id)?;
                 return Err(AppError::media_processing(message, None));
             }
-            CommandEvent::Terminated(payload) => {
+            CommandEvent::Terminated(payload_evt) => {
                 let removed = take_running_process(&state, &job_id)?;
-                if payload.code == Some(0) {
+                if payload_evt.code == Some(0) {
+                    let elapsed = start.elapsed();
+                    log::info!(
+                        "[render] Render complete: {} ({:.1}s)",
+                        payload.output_path,
+                        elapsed.as_secs_f64()
+                    );
                     emit_progress(&app, &job_id, "render", 100.0, "Render hoàn tất.", Some(0));
                     if removed.is_some() {
                         break;
                     }
                 } else if removed.is_none() {
+                    log::warn!("[render] Render cancelled by user");
                     return Err(AppError::cancelled("Job đã bị hủy bởi người dùng.", None));
                 } else {
+                    log::error!("[render] Render failed with code {:?}", payload_evt.code);
                     let ffmpeg_log = stderr_lines.join("\n");
-                    return Err(AppError::media_processing(format!("Render thất bại với code {:?}\n\n--- FFmpeg log ---\n{}", payload.code, ffmpeg_log), None));
+                    return Err(AppError::media_processing(format!("Render thất bại với code {:?}\n\n--- FFmpeg log ---\n{}", payload_evt.code, ffmpeg_log), None));
                 }
             }
             _ => {}
@@ -2477,6 +2483,7 @@ fn load_project_snapshot(path: String) -> AppResult<ProjectSnapshot> {
     let snapshot: ProjectSnapshot =
         serde_json::from_slice(&raw)?;
     migrate_project_snapshot(snapshot)
+        .map_err(|e| AppError::validation(e, None))
 }
 
 #[tauri::command]
@@ -2623,9 +2630,14 @@ fn cancel_pipeline_process(
     state: State<'_, RunningProcesses>,
     job_id: String,
 ) -> AppResult<()> {
+    log::info!("[cancel] Cancelling pipeline: job_id={}", job_id);
+    
+    let mut cancelled_types = Vec::new();
+    
     // Cancel ffmpeg/sidecar processes.
     if let Some(child) = take_running_process(&state, &job_id)? {
         child.kill()?;
+        cancelled_types.push("process");
     }
 
     // Cancel whisper-rs jobs via AtomicBool token.
@@ -2636,6 +2648,7 @@ fn cancel_pipeline_process(
             ?;
         if let Some(token) = tokens.remove(&job_id) {
             token.store(true, std::sync::atomic::Ordering::Relaxed);
+            cancelled_types.push("whisper");
         }
     }
 
@@ -2647,7 +2660,12 @@ fn cancel_pipeline_process(
             ?;
         if let Some(token) = tokens.remove(&job_id) {
             token.store(true, std::sync::atomic::Ordering::Relaxed);
+            cancelled_types.push("gemini");
         }
+    }
+    
+    if !cancelled_types.is_empty() {
+        log::info!("[cancel] Cancelled: {}", cancelled_types.join(", "));
     }
 
     emit_progress(
@@ -2663,6 +2681,11 @@ fn cancel_pipeline_process(
 }
 
 pub fn run() {
+    // Initialize logger with millisecond timestamps
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_millis()
+        .init();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
