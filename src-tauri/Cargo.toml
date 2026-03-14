@@ -15,6 +15,8 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 aes-gcm = "0.10"
 base64 = "0.22"
+env_logger = "0.11"
+log = "0.4"
 pbkdf2 = "0.12"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

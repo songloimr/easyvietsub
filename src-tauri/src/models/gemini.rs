@@ -68,7 +68,17 @@ pub const GEMINI_MODELS_ALLOWLIST: &[&str] = &[
 
 /// Number of subtitle segments per translation chunk.
 pub const TRANSLATION_CHUNK_SIZE: usize = 300;
+/// Minimum chunk size for adaptive chunking.
+pub const MIN_CHUNK_SIZE: usize = 50;
+/// Maximum chunk size for adaptive chunking.
+pub const MAX_CHUNK_SIZE: usize = 500;
 /// Number of previously-translated segments sent as context for continuity.
 pub const TRANSLATION_CONTEXT_SIZE: usize = 20;
 /// Maximum retry depth when splitting an oversized chunk in half.
 pub const MAX_CHUNK_SPLIT_DEPTH: usize = 2;
+/// Audio chunk duration for Gemini direct mode (seconds).
+pub const GEMINI_AUDIO_CHUNK_DURATION_SECS: f64 = 20.0;
+/// Maximum number of retries for Gemini API calls (total attempts = MAX_GEMINI_RETRIES + 1)
+pub const MAX_GEMINI_RETRIES: u32 = 2;
+/// Initial backoff duration in milliseconds for Gemini retries
+pub const GEMINI_INITIAL_BACKOFF_MS: u64 = 1000;
