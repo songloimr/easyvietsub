@@ -48,37 +48,27 @@ pub enum AppError {
     FileSystem {
         message: String,
         path: Option<String>,
-        #[serde(skip_serializing)]
-        source: Option<String>,
     },
     /// Network/HTTP errors (API calls, downloads, etc.)
     Network {
         message: String,
         url: Option<String>,
         status_code: Option<u16>,
-        #[serde(skip_serializing)]
-        source: Option<String>,
     },
     /// Media processing errors (FFmpeg, Whisper, audio decoding, etc.)
     MediaProcessing {
         message: String,
         context: Option<String>,
-        #[serde(skip_serializing)]
-        source: Option<String>,
     },
     /// AI/ML model errors (Whisper, Gemini, model loading, etc.)
     Model {
         message: String,
         model_name: Option<String>,
-        #[serde(skip_serializing)]
-        source: Option<String>,
     },
     /// Configuration/settings errors
     Configuration {
         message: String,
         key: Option<String>,
-        #[serde(skip_serializing)]
-        source: Option<String>,
     },
     /// User cancellation
     Cancelled {
@@ -91,11 +81,7 @@ pub enum AppError {
         field: Option<String>,
     },
     /// Unexpected/unknown errors
-    Unknown {
-        message: String,
-        #[serde(skip_serializing)]
-        source: Option<String>,
-    },
+    Unknown { message: String },
 }
 
 impl fmt::Display for AppError {
@@ -235,19 +221,6 @@ impl AppError {
         AppError::FileSystem {
             message: message.into(),
             path,
-            source: None,
-        }
-    }
-
-    pub fn file_system_with_source(
-        message: impl Into<String>,
-        path: Option<String>,
-        source: impl std::error::Error,
-    ) -> Self {
-        AppError::FileSystem {
-            message: message.into(),
-            path,
-            source: Some(source.to_string()),
         }
     }
 
@@ -260,20 +233,6 @@ impl AppError {
             message: message.into(),
             url,
             status_code,
-            source: None,
-        }
-    }
-
-    pub fn network_with_source(
-        message: impl Into<String>,
-        url: Option<String>,
-        source: impl std::error::Error,
-    ) -> Self {
-        AppError::Network {
-            message: message.into(),
-            url,
-            status_code: None,
-            source: Some(source.to_string()),
         }
     }
 
@@ -281,19 +240,6 @@ impl AppError {
         AppError::MediaProcessing {
             message: message.into(),
             context,
-            source: None,
-        }
-    }
-
-    pub fn media_processing_with_source(
-        message: impl Into<String>,
-        context: Option<String>,
-        source: impl std::error::Error,
-    ) -> Self {
-        AppError::MediaProcessing {
-            message: message.into(),
-            context,
-            source: Some(source.to_string()),
         }
     }
 
@@ -301,19 +247,6 @@ impl AppError {
         AppError::Model {
             message: message.into(),
             model_name,
-            source: None,
-        }
-    }
-
-    pub fn model_with_source(
-        message: impl Into<String>,
-        model_name: Option<String>,
-        source: impl std::error::Error,
-    ) -> Self {
-        AppError::Model {
-            message: message.into(),
-            model_name,
-            source: Some(source.to_string()),
         }
     }
 
@@ -321,7 +254,6 @@ impl AppError {
         AppError::Configuration {
             message: message.into(),
             key,
-            source: None,
         }
     }
 
@@ -342,14 +274,6 @@ impl AppError {
     pub fn unknown(message: impl Into<String>) -> Self {
         AppError::Unknown {
             message: message.into(),
-            source: None,
-        }
-    }
-
-    pub fn unknown_with_source(message: impl Into<String>, source: impl std::error::Error) -> Self {
-        AppError::Unknown {
-            message: message.into(),
-            source: Some(source.to_string()),
         }
     }
 }
@@ -364,7 +288,7 @@ impl From<std::io::Error> for AppError {
             std::io::ErrorKind::PermissionDenied => {
                 AppError::file_system("Permission denied", None)
             }
-            _ => AppError::file_system_with_source("I/O error", None, err),
+            _ => AppError::file_system(format!("I/O error: {}", err), None),
         }
     }
 }
@@ -380,7 +304,7 @@ impl From<reqwest::Error> for AppError {
         } else if err.is_connect() {
             AppError::network("Connection failed", url, status_code)
         } else {
-            AppError::network_with_source("HTTP request failed", url, err)
+            AppError::network(format!("HTTP request failed: {}", err), url, status_code)
         }
     }
 }
