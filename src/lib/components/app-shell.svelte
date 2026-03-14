@@ -35,7 +35,6 @@
   } from '$lib/stores/app-store';
   import { fetchSupportedGeminiModels, openPathSelection, savePathSelection } from '$lib/services/tauri';
   import { PIPELINE_TIMER_INTERVAL_MS } from '$lib/constants';
-  import Subtitles from '@lucide/svelte/icons/subtitles';
   import { onDestroy, onMount } from 'svelte';
 
   // Local state
@@ -317,12 +316,7 @@
     <!-- Top header -->
     <header class="sticky top-0 z-30 border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
       <div class="flex h-13 items-center gap-3 px-4">
-        <div class="flex items-center gap-2">
-          <Subtitles class="size-5 text-primary" />
-          <h1 class="text-lg font-semibold">EasyVietsub</h1>
-        </div>
-        
-        <Menubar menus={projectMenus} class="ml-auto" />
+        <Menubar menus={projectMenus} />
       </div>
     </header>
 

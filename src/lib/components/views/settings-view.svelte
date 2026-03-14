@@ -293,9 +293,9 @@
           Cache bao gồm file audio tạm và dữ liệu phân đoạn. Xóa cache giúp tiết kiệm dung lượng ổ đĩa.
         </p>
 
-        <div class="space-y-2">
+        <div class="flex gap-2">
           <Button
-            class="w-full"
+            class="flex-1"
             variant="outline"
             disabled={cleaningCache}
             onclick={() => handleCleanupOldCache(7)}
@@ -306,11 +306,11 @@
             {:else}
               <Trash2 class="size-4" />
             {/if}
-            Xóa cache cũ hơn 7 ngày
+            Cache > 7 ngày
           </Button>
 
           <Button
-            class="w-full"
+            class="flex-1"
             variant="outline"
             disabled={cleaningCache}
             onclick={() => handleCleanupOldCache(30)}
@@ -321,11 +321,11 @@
             {:else}
               <Trash2 class="size-4" />
             {/if}
-            Xóa cache cũ hơn 30 ngày
+            Cache > 30 ngày
           </Button>
 
           <Button
-            class="w-full"
+            class="flex-1"
             variant="destructive"
             disabled={cleaningCache}
             onclick={handleCleanupAllCache}
@@ -336,7 +336,7 @@
             {:else}
               <Trash2 class="size-4" />
             {/if}
-            Xóa toàn bộ cache
+            Xóa tất cả
           </Button>
         </div>
       </div>

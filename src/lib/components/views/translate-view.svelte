@@ -16,8 +16,6 @@
     activeJob,
     busy,
     cancelModelDownload,
-    canRedo,
-    canUndo,
     deleteModel,
     deletingModelId,
     downloadModel,
@@ -25,20 +23,17 @@
     downloadingModelProgress,
     inspection,
     inspectSelectedMedia,
-    pushUndoSnapshot,
-    redo,
     retranslateOnly,
     runtimeCapabilities,
     startPipeline,
     statusMessage,
-    undo,
     updateForm,
     updateSubtitleSegment,
     validationErrors,
     whisperModels
   } from '$lib/stores/app-store';
-  import { openPathSelection, savePathSelection, writeTextContent, readTextContent, exportAssSubtitle as exportAssSubtitleService } from '$lib/services/tauri';
-  import { segmentsToSrt, parseSrt } from '$lib/srt';
+  import { openPathSelection, savePathSelection, writeTextContent, exportAssSubtitle as exportAssSubtitleService } from '$lib/services/tauri';
+  import { segmentsToSrt } from '$lib/srt';
   import { formatBytes, formatDuration, formatTimestamp } from '$lib/utils';
   import { toast } from 'svelte-sonner';
   import AudioLines from '@lucide/svelte/icons/audio-lines';
@@ -46,14 +41,11 @@
   import ChevronDown from '@lucide/svelte/icons/chevron-down';
   import Download from '@lucide/svelte/icons/download';
   import FileText from '@lucide/svelte/icons/file-text';
-  import FileUp from '@lucide/svelte/icons/file-up';
   import FolderOpen from '@lucide/svelte/icons/folder-open';
   import Languages from '@lucide/svelte/icons/languages';
   import Play from '@lucide/svelte/icons/play';
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
   import Trash2 from '@lucide/svelte/icons/trash-2';
-  import Undo2 from '@lucide/svelte/icons/undo-2';
-  import Redo2 from '@lucide/svelte/icons/redo-2';
   import Video from '@lucide/svelte/icons/video';
   import AlertTriangle from '@lucide/svelte/icons/triangle-alert';
   import X from '@lucide/svelte/icons/x';
@@ -177,40 +169,6 @@
     }
   }
 
-  async function handleImportSrt(): Promise<void> {
-    try {
-      const path = await openPathSelection(false, [
-        {
-          name: 'SRT Subtitles',
-          extensions: ['srt']
-        }
-      ]);
-      
-      if (!path) return;
-      
-      const content = await readTextContent(path);
-      const segments = parseSrt(content);
-      
-      if (segments.length === 0) {
-        toast.error('Không tìm thấy subtitle nào trong file SRT');
-        return;
-      }
-      
-      // Push undo snapshot before bulk replacement
-      pushUndoSnapshot();
-
-      // Update both source and translated segments
-      $activeJob.sourceSegments = segments;
-      $activeJob.translatedSegments = segments.map(seg => ({ ...seg }));
-      $activeJob.status = 'completed';
-      
-      toast.success(`Đã import ${segments.length} subtitle từ file SRT`);
-    } catch (err) {
-      console.error('Lỗi khi import SRT:', err);
-      const msg = err instanceof Error ? err.message : 'Lỗi không xác định';
-      toast.error(`Import SRT thất bại: ${msg}`);
-    }
-  }
 </script>
 
 <div class="view-enter space-y-3">
@@ -280,58 +238,59 @@
         </div>
       {/if}
 
-      <!-- Row 2: Config selects (horizontal) -->
-      <div class="grid gap-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-        <Field label="Source language">
-          <Select
-            value={$activeJob.form.sourceLanguage}
-            options={SOURCE_LANGUAGE_OPTIONS}
-            onchange={(event) => updateForm('sourceLanguage', event.currentTarget.value)}
-          />
-        </Field>
-        <Field label="Processing mode">
-          <Select
-            value={$activeJob.form.processingMode}
-            options={[
-              { value: 'whisper_translate', label: 'Whisper + Gemini' },
-              { value: 'gemini_direct', label: 'Gemini direct' }
-            ]}
-            onchange={(event) =>
-              updateForm(
-                'processingMode',
-                event.currentTarget.value as typeof DEFAULT_FORM.processingMode
-              )
-            }
-          />
-        </Field>
-        <Field label="Gemini model">
-          <Select
-            value={$activeJob.form.geminiModelId}
-            options={FALLBACK_GEMINI_MODELS.map((model) => ({
-              value: model.id,
-              label: model.label
-            }))}
-            onchange={(event) => updateForm('geminiModelId', event.currentTarget.value)}
-          />
-        </Field>
-        {#if $inspection && $inspection.audioTracks.length > 1}
-          <Field label="Audio track">
+      <!-- Row 2: Config selects (2-column layout) -->
+      <div class="{usesWhisper ? 'grid grid-cols-2 gap-4' : 'grid grid-cols-1'}">
+        <!-- Column 1: General settings -->
+        <div class="space-y-2">
+          <Field label="Source language">
             <Select
-              value={$activeJob.form.selectedAudioTrack}
-              options={$inspection.audioTracks.map((track) => ({
-                value: track.index,
-                label: `Track ${track.index} • ${track.language || 'unknown'}`
-              }))}
-              onchange={(event) => updateForm('selectedAudioTrack', Number(event.currentTarget.value))}
+              value={$activeJob.form.sourceLanguage}
+              options={SOURCE_LANGUAGE_OPTIONS}
+              onchange={(event) => updateForm('sourceLanguage', event.currentTarget.value)}
             />
           </Field>
-        {/if}
-      </div>
+          <Field label="Processing mode">
+            <Select
+              value={$activeJob.form.processingMode}
+              options={[
+                { value: 'whisper_translate', label: 'Whisper + Gemini' },
+                { value: 'gemini_direct', label: 'Gemini direct' }
+              ]}
+              onchange={(event) =>
+                updateForm(
+                  'processingMode',
+                  event.currentTarget.value as typeof DEFAULT_FORM.processingMode
+                )
+              }
+            />
+          </Field>
+          <Field label="Gemini model">
+            <Select
+              value={$activeJob.form.geminiModelId}
+              options={FALLBACK_GEMINI_MODELS.map((model) => ({
+                value: model.id,
+                label: model.label
+              }))}
+              onchange={(event) => updateForm('geminiModelId', event.currentTarget.value)}
+            />
+          </Field>
+          {#if $inspection && $inspection.audioTracks.length > 1}
+            <Field label="Audio track">
+              <Select
+                value={$activeJob.form.selectedAudioTrack}
+                options={$inspection.audioTracks.map((track) => ({
+                  value: track.index,
+                  label: `Track ${track.index} • ${track.language || 'unknown'}`
+                }))}
+                onchange={(event) => updateForm('selectedAudioTrack', Number(event.currentTarget.value))}
+              />
+            </Field>
+          {/if}
+        </div>
 
-      <!-- Whisper config strip (conditional) -->
-      {#if usesWhisper}
-        <div class="rounded-lg border bg-muted/20 p-3">
-          <div class="grid gap-3 sm:grid-cols-[minmax(0,10rem)_minmax(0,1fr)]">
+        <!-- Column 2: Whisper settings (conditional) -->
+        {#if usesWhisper}
+          <div class="space-y-2">
             <Field label="Compute mode">
               <Select
                 value={$activeJob.form.computeMode}
@@ -403,8 +362,8 @@
               </div>
             </Field>
           </div>
-        </div>
-      {/if}
+        {/if}
+      </div>
     </div>
   </div>
 
@@ -444,16 +403,6 @@
     <div class="flex items-center justify-between gap-2 p-4">
       <h2 class="text-base font-semibold">Subtitle Editor</h2>
       <div class="flex items-center gap-2">
-        <Button variant="outline" size="sm" onclick={() => undo()} disabled={!$canUndo} class="text-xs" title="Undo (Cmd+Z)">
-          <Undo2 class="size-3.5" />
-        </Button>
-        <Button variant="outline" size="sm" onclick={() => redo()} disabled={!$canRedo} class="text-xs" title="Redo (Cmd+Shift+Z)">
-          <Redo2 class="size-3.5" />
-        </Button>
-        <Button variant="outline" size="sm" onclick={handleImportSrt} disabled={$busy} class="text-xs">
-          <FileUp class="size-3.5" />
-          <span>Import SRT</span>
-        </Button>
         {#if canRetranslate}
           <Button variant="outline" size="sm" onclick={handleRetranslateOnly} class="text-xs">
             <RefreshCw class="size-3.5" />
