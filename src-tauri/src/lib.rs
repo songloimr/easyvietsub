@@ -402,18 +402,6 @@ fn parse_ffmpeg_progress_ms(line: &str) -> Option<u64> {
     None
 }
 
-fn guess_accelerators() -> Vec<String> {
-    match std::env::consts::OS {
-        "macos" => vec!["videotoolbox".into(), "metal".into()],
-        "windows" => vec!["d3d12va".into(), "dxva2".into()],
-        _ => Vec::new(),
-    }
-}
-
-fn hardware_acceleration_available() -> bool {
-    !guess_accelerators().is_empty()
-}
-
 fn parse_hex_color(input: &str) -> (u8, u8, u8, u8) {
     let clean = input.trim().trim_start_matches('#');
     match clean.len() {
@@ -607,7 +595,6 @@ fn export_ass_subtitle(
 
 #[tauri::command]
 fn detect_runtime_capabilities(app: AppHandle) -> RuntimeCapabilities {
-    let accelerators = guess_accelerators();
     let local_ffmpeg_installed = managed_binary_path(&app, "ffmpeg")
         .map(|path| path.exists())
         .unwrap_or(false);
@@ -621,8 +608,6 @@ fn detect_runtime_capabilities(app: AppHandle) -> RuntimeCapabilities {
         ffprobe_available: resolve_ffprobe_path(&app).is_ok(),
         local_ffmpeg_installed,
         local_ffprobe_installed,
-        hardware_acceleration_available: !accelerators.is_empty(),
-        detected_accelerators: accelerators,
     }
 }
 
@@ -965,10 +950,10 @@ async fn transcribe_with_whisper(
     let start = std::time::Instant::now();
     
     log::info!(
-        "[whisper] Starting transcription: job_id={}, model={}, compute={}",
+        "[whisper] Starting transcription: job_id={}, model={}, cpu_only={}",
         job_id,
         payload.model_id,
-        payload.compute_mode
+        payload.cpu_only
     );
     
     let model = whisper_model_catalog()
@@ -980,33 +965,9 @@ async fn transcribe_with_whisper(
         return Err(AppError::model("Whisper model chưa được tải. Hãy tải model trong phần setup trước khi chạy.", None));
     }
 
-    let normalized_compute_mode = payload.compute_mode.to_lowercase();
-    let hardware_available = hardware_acceleration_available();
-    let use_gpu = match normalized_compute_mode.as_str() {
-        "cpu" => false,
-        "hardware" => hardware_available,
-        _ => hardware_available,
-    };
+    let use_gpu = !payload.cpu_only;
 
-    if normalized_compute_mode == "hardware" && !hardware_available {
-        emit_progress(
-            &app,
-            &job_id,
-            "transcribe",
-            43.0,
-            "Thiết bị không có hardware acceleration khả dụng. Whisper sẽ fallback sang CPU.",
-            None,
-        );
-    } else if normalized_compute_mode == "auto" && !hardware_available {
-        emit_progress(
-            &app,
-            &job_id,
-            "transcribe",
-            43.0,
-            "Không phát hiện accelerator phù hợp. Whisper sẽ chạy ở CPU mode.",
-            None,
-        );
-    } else if normalized_compute_mode == "cpu" {
+    if payload.cpu_only {
         emit_progress(
             &app,
             &job_id,

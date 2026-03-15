@@ -62,7 +62,7 @@ export const DEFAULT_FORM: JobFormState = {
   inputKind: 'video',
   sourceLanguage: 'en',
   processingMode: 'whisper_translate',
-  computeMode: 'auto',
+  cpuOnly: false,
   selectedAudioTrack: 0,
   whisperModelId: 'small',
   geminiModelId: 'gemini-2.5-flash-lite',

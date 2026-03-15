@@ -83,7 +83,7 @@ export interface TauriCommands {
         trackIndex: number;
         sourceLanguage: string;
         modelId: string;
-        computeMode: string;
+        cpuOnly: boolean;
       };
     };
     output: SubtitleSegment[];

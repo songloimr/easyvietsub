@@ -4,8 +4,6 @@ export type InputKind = 'video' | 'audio';
 
 export type ProcessingMode = 'whisper_translate' | 'gemini_direct';
 
-export type ComputeMode = 'auto' | 'cpu' | 'hardware';
-
 export type JobPhase =
   | 'idle'
   | 'inspect'
@@ -93,7 +91,7 @@ export interface JobFormState {
   inputKind: InputKind;
   sourceLanguage: string;
   processingMode: ProcessingMode;
-  computeMode: ComputeMode;
+  cpuOnly: boolean;
   selectedAudioTrack: number;
   whisperModelId: string;
   geminiModelId: string;
@@ -106,8 +104,7 @@ export interface RuntimeCapabilities {
   ffprobeAvailable: boolean;
   localFfmpegInstalled: boolean;
   localFfprobeInstalled: boolean;
-  hardwareAccelerationAvailable: boolean;
-  detectedAccelerators: string[];
+
 }
 
 export interface JobRecord {

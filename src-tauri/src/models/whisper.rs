@@ -18,7 +18,8 @@ pub struct WhisperRequest {
     pub track_index: u32,
     pub source_language: String,
     pub model_id: String,
-    pub compute_mode: String,
+    #[serde(default)]
+    pub cpu_only: bool,
 }
 
 pub fn whisper_model_catalog() -> Vec<(String, String, String, u64, String, String)> {

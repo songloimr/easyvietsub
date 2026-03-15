@@ -925,7 +925,7 @@ export async function startPipeline(apiKey: string): Promise<void> {
         trackIndex,
         sourceLanguage: job.form.sourceLanguage,
         modelId: job.form.whisperModelId,
-        computeMode: job.form.computeMode
+        cpuOnly: job.form.cpuOnly
       });
 
       throwIfCancelled();

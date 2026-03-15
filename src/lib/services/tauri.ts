@@ -92,8 +92,7 @@ export async function detectRuntimeCapabilities(): Promise<RuntimeCapabilities> 
       ffprobeAvailable: false,
       localFfmpegInstalled: false,
       localFfprobeInstalled: false,
-      hardwareAccelerationAvailable: false,
-      detectedAccelerators: []
+
     };
   }
 
@@ -154,7 +153,7 @@ export async function transcribeWithWhisper(payload: {
   trackIndex: number;
   sourceLanguage: string;
   modelId: string;
-  computeMode: string;
+  cpuOnly: boolean;
 }): Promise<SubtitleSegment[]> {
   return invokeTauri('transcribe_with_whisper', {
     jobId: payload.jobId,
@@ -163,7 +162,7 @@ export async function transcribeWithWhisper(payload: {
       trackIndex: payload.trackIndex,
       sourceLanguage: payload.sourceLanguage,
       modelId: payload.modelId,
-      computeMode: payload.computeMode
+      cpuOnly: payload.cpuOnly
     }
   });
 }

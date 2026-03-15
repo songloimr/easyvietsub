@@ -9,8 +9,6 @@ pub struct RuntimeCapabilities {
     pub ffprobe_available: bool,
     pub local_ffmpeg_installed: bool,
     pub local_ffprobe_installed: bool,
-    pub hardware_acceleration_available: bool,
-    pub detected_accelerators: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
