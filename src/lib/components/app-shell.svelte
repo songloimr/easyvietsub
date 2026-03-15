@@ -57,6 +57,7 @@
   let successDialogTitle = $state('');
   let successDialogMessage = $state('');
   let lastCompletedJobId = $state('');
+  let lastFailedJobId = $state('');
 
   // Pipeline timer
   let pipelineElapsedSeconds = $state(0);
@@ -154,7 +155,8 @@
 
   // Auto-show error dialog on failure
   $effect(() => {
-    if ($activeJob.status === 'failed' && !$busy && $activeJob.phase === 'failed') {
+    if ($activeJob.status === 'failed' && !$busy && $activeJob.phase === 'failed' && $activeJob.id !== lastFailedJobId) {
+      lastFailedJobId = $activeJob.id;
       const latestLog = $processLogs.find((log) => log.jobId === $activeJob.id);
       showErrorDialog(
         'Pipeline thất bại',
@@ -163,6 +165,7 @@
       );
     }
   });
+
 
   // Auto-show success dialog on completion
   $effect(() => {
