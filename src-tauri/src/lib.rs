@@ -1646,19 +1646,19 @@ async fn translate_single_chunk(
         
         let mut reconciled = Vec::with_capacity(expected_count);
         for (i, original) in chunk.iter().enumerate() {
-            // Use Gemini's translation if available, otherwise copy source text
+            // Use Gemini's translation if available, otherwise leave empty
             let translated_text = translated.get(i)
                 .map(|t| t.source_text.clone()) // parse_srt puts text into source_text field
                 .unwrap_or_else(|| {
                     log::warn!(
-                        "[translate] Chunk {}/{}: Missing translation for segment {} ({}..{}ms), using source text as fallback",
+                        "[translate] Chunk {}/{}: Missing translation for segment {} ({}..{}ms), leaving empty",
                         chunk_idx + 1,
                         total_chunks,
                         i + 1,
                         original.start_ms,
                         original.end_ms
                     );
-                    original.source_text.clone()
+                    String::new()
                 });
             
             reconciled.push(SubtitleSegment {
@@ -1977,7 +1977,7 @@ async fn translate_segments_with_gemini(
                     total_chunks,
                     error
                 );
-                // Fallback: copy sourceText for this chunk's segments only
+                // Fallback: leave translatedText empty for this chunk's segments
                 let original_offset = chunk_idx * chunk_size;
                 for (i, _seg) in chunk.iter().enumerate() {
                     let original = &all_segments[original_offset + i];
@@ -1986,7 +1986,7 @@ async fn translate_segments_with_gemini(
                         start_ms: original.start_ms,
                         end_ms: original.end_ms,
                         source_text: original.source_text.clone(),
-                        translated_text: original.source_text.clone(),
+                        translated_text: String::new(),
                     });
                 }
             }

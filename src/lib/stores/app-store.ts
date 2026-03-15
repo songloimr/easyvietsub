@@ -930,10 +930,10 @@ export async function startPipeline(apiKey: string): Promise<void> {
 
       throwIfCancelled();
 
-      // Immediately show source-language subtitles (copy sourceText to translatedText)
+      // Immediately show empty translated segments (don't copy source text)
       const interimTranslatedSegments = sourceSegments.map(seg => ({
         ...seg,
-        translatedText: seg.sourceText
+        translatedText: ''
       }));
 
       job = updateJob(job, {
