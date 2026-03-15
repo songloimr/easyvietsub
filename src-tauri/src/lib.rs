@@ -1000,59 +1000,110 @@ async fn transcribe_with_whisper(
     let app_clone = app.clone();
     let job_id_clone = job_id.clone();
     let model_path_str = model_path.to_string_lossy().to_string();
+    let model_path_str_for_cache = model_path_str.clone();
     let audio_path = payload.audio_path.clone();
     let track_index = payload.track_index;
     let source_language = payload.source_language.clone();
 
     // Retrieve or create a cached WhisperContext to avoid reloading the model every time.
-    let whisper_ctx: Arc<WhisperContext> = {
+    // If the cache has a CPU-fallback context for the same model (cached_gpu=false but use_gpu=true),
+    // reuse it instead of re-creating a GPU context that will likely fail again.
+    //
+    // Helper: create a new WhisperContext, falling back to CPU if GPU creation fails.
+    let create_whisper_ctx = |model_path: &str, want_gpu: bool| -> AppResult<(Arc<WhisperContext>, bool)> {
+        let mut ctx_params = WhisperContextParameters::default();
+        ctx_params.use_gpu(want_gpu);
+        match WhisperContext::new_with_params(model_path, ctx_params) {
+            Ok(ctx) => Ok((Arc::new(ctx), want_gpu)),
+            Err(e) if want_gpu => {
+                log::warn!("[whisper] GPU context creation failed ({}), falling back to CPU...", e);
+                let mut cpu_params = WhisperContextParameters::default();
+                cpu_params.use_gpu(false);
+                let ctx = WhisperContext::new_with_params(model_path, cpu_params)
+                    .map_err(|e2| AppError::model(format!("Không tải được Whisper model (cả GPU và CPU đều lỗi): GPU={e}, CPU={e2}"), None))?;
+                Ok((Arc::new(ctx), false))
+            }
+            Err(e) => Err(AppError::model(format!("Không tải được Whisper model: {e}"), None)),
+        }
+    };
+
+    let (whisper_ctx, use_gpu): (Arc<WhisperContext>, bool) = {
         let mut cache = state
             .whisper_ctx_cache
             .lock()
             ?;
 
         if let Some((ref cached_path, cached_gpu, ref ctx)) = *cache {
-            if cached_path == &model_path_str && cached_gpu == use_gpu {
-                Arc::clone(ctx)
+            if cached_path == &model_path_str {
+                if cached_gpu == use_gpu {
+                    // Exact match: same model, same GPU setting
+                    (Arc::clone(ctx), use_gpu)
+                } else if !cached_gpu && use_gpu {
+                    // Cache has CPU context but we want GPU — this means GPU previously failed
+                    // and we fell back to CPU. Reuse the CPU context to avoid re-triggering the error.
+                    log::info!("[whisper] Reusing cached CPU context (GPU previously failed for this model)");
+                    (Arc::clone(ctx), false)
+                } else {
+                    // Cache has GPU context but we want CPU — reload
+                    let (new_ctx, actual_gpu) = create_whisper_ctx(&model_path_str, use_gpu)?;
+                    *cache = Some((model_path_str.clone(), actual_gpu, Arc::clone(&new_ctx)));
+                    (new_ctx, actual_gpu)
+                }
             } else {
-                // Model or GPU setting changed — drop old, load new.
-                let mut ctx_params = WhisperContextParameters::default();
-                ctx_params.use_gpu(use_gpu);
-                let new_ctx = Arc::new(
-                    WhisperContext::new_with_params(&model_path_str, ctx_params)
-                        .map_err(|e| AppError::model(format!("Không tải được Whisper model: {e}"), None))?,
-                );
-                *cache = Some((model_path_str.clone(), use_gpu, Arc::clone(&new_ctx)));
-                new_ctx
+                // Different model — drop old, load new
+                let (new_ctx, actual_gpu) = create_whisper_ctx(&model_path_str, use_gpu)?;
+                *cache = Some((model_path_str.clone(), actual_gpu, Arc::clone(&new_ctx)));
+                (new_ctx, actual_gpu)
             }
         } else {
-            let mut ctx_params = WhisperContextParameters::default();
-            ctx_params.use_gpu(use_gpu);
-            let new_ctx = Arc::new(
-                WhisperContext::new_with_params(&model_path_str, ctx_params)
-                    .map_err(|e| AppError::model(format!("Không tải được Whisper model: {e}"), None))?,
-            );
-            *cache = Some((model_path_str.clone(), use_gpu, Arc::clone(&new_ctx)));
-            new_ctx
+            let (new_ctx, actual_gpu) = create_whisper_ctx(&model_path_str, use_gpu)?;
+            *cache = Some((model_path_str.clone(), actual_gpu, Arc::clone(&new_ctx)));
+            (new_ctx, actual_gpu)
         }
     };
 
     // Run blocking whisper-rs inference on a dedicated thread.
-    let result = tokio::task::spawn_blocking(move || {
+    // Returns (segments, cpu_context_if_retried)
+    let result: AppResult<(Vec<SubtitleSegment>, Option<WhisperContext>)> = tokio::task::spawn_blocking(move || {
+        // Helper to create FullParams with all settings
+        let make_params = || {
+            let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+            params.set_temperature(0.1);
+            params.set_temperature_inc(0.0);
+            params.set_n_max_text_ctx(64);
+            params.set_entropy_thold(3.0);
+            params.set_print_progress(false);
+            params.set_print_realtime(false);
+            params.set_print_timestamps(false);
 
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-        params.set_temperature(0.1);
-        params.set_temperature_inc(0.0);
-        params.set_n_max_text_ctx(64);
-        params.set_entropy_thold(3.0);
-        params.set_print_progress(false);
-        params.set_print_realtime(false);
-        params.set_print_timestamps(false);
+            if source_language != "auto" {
+                params.set_language(Some(source_language.as_str()));
+            }
 
-        if source_language != "auto" {
-            params.set_language(Some(source_language.as_str()));
-        }
-        // Emit progress at 48% to show model is loaded.
+            // Set up progress callback
+            let cb_app = app_clone.clone();
+            let cb_job_id = job_id_clone.clone();
+            params.set_progress_callback_safe(move |progress| {
+                let pipeline_pct = 50.0 + (progress as f64 * 0.13);
+                emit_progress(
+                    &cb_app,
+                    &cb_job_id,
+                    "transcribe",
+                    pipeline_pct,
+                    &format!("Đang nhận dạng giọng nói... {}%", progress),
+                    None,
+                );
+            });
+
+            // Set up abort callback
+            let cb_cancel_token = Arc::clone(&cancel_token);
+            params.set_abort_callback_safe(move || {
+                cb_cancel_token.load(std::sync::atomic::Ordering::Relaxed)
+            });
+
+            params
+        };
+
         emit_progress(
             &app_clone,
             &job_id_clone,
@@ -1074,50 +1125,113 @@ async fn transcribe_with_whisper(
             None,
         );
 
-        // Set up progress callback to emit real-time progress during inference.
-        {
-            let cb_app = app_clone.clone();
-            let cb_job_id = job_id_clone.clone();
-            params.set_progress_callback_safe(move |progress| {
-                // Map whisper 0-100% to pipeline 50-63%.
-                let pipeline_pct = 50.0 + (progress as f64 * 0.13);
+        // First attempt with the original context
+        let params = make_params();
+        let state_result = whisper_ctx
+            .create_state()
+            .map_err(|error| AppError::model(format!("Không khởi tạo được Whisper state: {error}"), None));
+
+        // If create_state fails on GPU context, try creating a CPU context and state instead
+        let (mut state_whisper, early_cpu_ctx) = match state_result {
+            Ok(st) => (st, None),
+            Err(e) if use_gpu => {
+                log::warn!("[whisper] GPU create_state failed ({}), falling back to CPU...", e);
+                let mut cpu_params = WhisperContextParameters::default();
+                cpu_params.use_gpu(false);
+                let cpu_ctx = WhisperContext::new_with_params(&model_path_str, cpu_params)
+                    .map_err(|e2| AppError::model(format!("Không tải được Whisper CPU context: {e2}"), None))?;
+                let st = cpu_ctx.create_state()
+                    .map_err(|e2| AppError::model(format!("Không khởi tạo được CPU Whisper state: {e2}"), None))?;
+                (st, Some(cpu_ctx))
+            }
+            Err(e) => return Err(e),
+        };
+
+        let inference_result = state_whisper.full(params, mapped_audio.samples());
+
+        // Helper: check if an error is a transient encoder failure worth retrying with a fresh context.
+        // Error -6 = whisper_encode_internal failed (can happen on both GPU and CPU).
+        let is_retriable_encoder_error = |err: &whisper_rs::WhisperError| -> bool {
+            let err_str = format!("{err}").to_lowercase();
+            err_str.contains("error code: -6")
+                || err_str.contains("error code: -7")
+                || err_str.contains("error code: -8")
+                || err_str.contains("failed to run the encoder")
+                || err_str.contains("failed to encode")
+        };
+
+        // Handle inference result with GPU fallback on encoder/GPU errors
+        let (final_state, cpu_ctx_for_cache) = if let Err(ref err) = inference_result {
+            // Check if cancel was requested
+            if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(AppError::cancelled("Job đã bị hủy bởi người dùng.", None));
+            }
+
+            // Check if this is a retriable encoder error (can happen on GPU or CPU)
+            let err_str = format!("{err}");
+            if is_retriable_encoder_error(err) {
+                log::warn!("[whisper] Encoder failed ({}), retrying with fresh context...", err_str);
                 emit_progress(
-                    &cb_app,
-                    &cb_job_id,
+                    &app_clone,
+                    &job_id_clone,
                     "transcribe",
-                    pipeline_pct,
-                    &format!("Đang nhận dạng giọng nói... {}%", progress),
+                    50.0,
+                    "Encoder thất bại, đang thử lại với context mới...",
                     None,
                 );
-            });
-        }
 
-        // Set up abort callback to allow cancellation during inference.
-        {
-            let cb_cancel_token = Arc::clone(&cancel_token);
-            params.set_abort_callback_safe(move || {
-                cb_cancel_token.load(std::sync::atomic::Ordering::Relaxed)
-            });
-        }
+                // Create new CPU context
+                let mut cpu_params = WhisperContextParameters::default();
+                cpu_params.use_gpu(false);
+                let cpu_ctx = WhisperContext::new_with_params(&model_path_str, cpu_params)
+                    .map_err(|e| AppError::model(format!("Không tải được Whisper CPU context: {e}"), None))?;
 
-        let mut state_whisper = whisper_ctx
-            .create_state()
-            .map_err(|error| AppError::model(format!("Không khởi tạo được Whisper state: {error}"), None))?;
+                // Create state and retry with CPU
+                let mut cpu_state = cpu_ctx.create_state()
+                    .map_err(|error| AppError::model(format!("Không khởi tạo được CPU Whisper state: {error}"), None))?;
 
-        state_whisper
-            .full(params, mapped_audio.samples())
-            .map_err(|error| AppError::model(format!("Whisper inference thất bại: {error}"), None))?;
+                let retry_params = make_params();
+                cpu_state
+                    .full(retry_params, mapped_audio.samples())
+                    .map_err(|error| {
+                        if cancel_token.load(std::sync::atomic::Ordering::Relaxed) {
+                            return AppError::cancelled("Job đã bị hủy bởi người dùng.", None);
+                        }
+                        log::error!("[whisper] Retry with fresh context also failed: {}", error);
+                        AppError::model(format!("Whisper inference thất bại (cả hai lần đều lỗi): {error}"), None)
+                    })?;
 
-        emit_progress(
-            &app_clone,
-            &job_id_clone,
-            "transcribe",
-            63.0,
-            "Đang đọc kết quả transcription.",
-            None,
-        );
+                log::info!("[whisper] Retry with fresh context succeeded");
 
-        let num_segments = state_whisper
+                emit_progress(
+                    &app_clone,
+                    &job_id_clone,
+                    "transcribe",
+                    63.0,
+                    "Retry thành công. Đang đọc kết quả transcription.",
+                    None,
+                );
+
+                (cpu_state, Some(cpu_ctx))
+            } else {
+                // Not a retriable encoder error — fail immediately
+                return Err(AppError::model(format!("Whisper inference thất bại: {err}"), None));
+            }
+        } else {
+            // First attempt succeeded
+            emit_progress(
+                &app_clone,
+                &job_id_clone,
+                "transcribe",
+                63.0,
+                "Đang đọc kết quả transcription.",
+                None,
+            );
+            (state_whisper, None)
+        };
+
+        // Read segments from the successful state
+        let num_segments = final_state
             .full_n_segments()
             .map_err(|error| AppError::model(format!("Không đọc được số segments: {error}"), None))?;
 
@@ -1127,14 +1241,14 @@ async fn transcribe_with_whisper(
                 return Err(AppError::cancelled("Job đã bị hủy bởi người dùng.", None));
             }
 
-            let text = state_whisper
+            let text = final_state
                 .full_get_segment_text(i)
                 .map_err(|error| AppError::model(format!("Không đọc được segment text {i}: {error}"), None))?;
-            let start_ms = (state_whisper
+            let start_ms = (final_state
                 .full_get_segment_t0(i)
                 .map_err(|error| AppError::model(format!("Không đọc được segment timestamp {i}: {error}"), None))?
                 * 10) as u64;
-            let end_ms = (state_whisper
+            let end_ms = (final_state
                 .full_get_segment_t1(i)
                 .map_err(|error| AppError::model(format!("Không đọc được segment timestamp {i}: {error}"), None))?
                 * 10) as u64;
@@ -1153,7 +1267,7 @@ async fn transcribe_with_whisper(
             });
         }
 
-        Ok(subtitle_segments)
+        Ok((subtitle_segments, cpu_ctx_for_cache.or(early_cpu_ctx)))
     })
     .await
     .map_err(|error| AppError::model(format!("Whisper thread panic: {error}"), None))?;
@@ -1170,7 +1284,14 @@ async fn transcribe_with_whisper(
     // PCM cache file is kept for potential retries — cleanup via cleanup_job_cache.
 
     match result {
-        Ok(segments) => {
+        Ok((segments, cpu_ctx_opt)) => {
+            // If CPU retry occurred, update cache to use CPU context for future runs
+            if let Some(cpu_ctx) = cpu_ctx_opt {
+                log::info!("[whisper] Updating cache to CPU context after successful retry");
+                let mut cache = state.whisper_ctx_cache.lock()?;
+                *cache = Some((model_path_str_for_cache, false, Arc::new(cpu_ctx)));
+            }
+
             let elapsed = start.elapsed();
             log::info!(
                 "[whisper] Transcription complete: {} segments in {:.1}s",
