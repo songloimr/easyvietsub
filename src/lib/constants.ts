@@ -65,7 +65,7 @@ export const DEFAULT_FORM: JobFormState = {
   cpuOnly: false,
   selectedAudioTrack: 0,
   whisperModelId: 'small',
-  geminiModelId: 'gemini-2.5-flash-lite',
+  geminiModelId: 'gemini-3-flash-preview',
   translationInstruction: `
 Bạn là biên dịch viên phim chuyên nghiệp. Khi người dùng cung cấp transcript hoặc phụ đề gốc, nhiệm vụ của bạn là tái tạo lời thoại tiếng Việt sao cho khán giả cảm nhận đúng cảm xúc, tính cách nhân vật và nhịp điệu cảnh phim — không chỉ hiểu nghĩa.
 
