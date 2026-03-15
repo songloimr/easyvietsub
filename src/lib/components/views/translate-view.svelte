@@ -86,7 +86,7 @@
     $activeJob.form.processingMode === 'whisper_translate' &&
     !$busy
   );
-  let translatedSegmentCount = $derived($activeJob.translatedSegments.length);
+  let translatedSegmentCount = $derived($activeJob.translatedSegments.filter(s => s.translatedText.trim() !== '').length);
   let usesWhisper = $derived($activeJob.form.processingMode === 'whisper_translate');
   let ffmpegReady = $derived(
     !!$runtimeCapabilities?.ffmpegAvailable || !!$runtimeCapabilities?.localFfmpegInstalled
@@ -291,18 +291,19 @@
         <!-- Column 2: Whisper settings (conditional) -->
         {#if usesWhisper}
           <div class="space-y-2">
-            <Field label="Compute mode">
-              <Select
-                value={$activeJob.form.computeMode}
-                options={[
-                  { value: 'auto', label: 'Auto' },
-                  { value: 'cpu', label: 'CPU' },
-                  { value: 'hardware', label: 'GPU' }
-                ]}
-                onchange={(event) =>
-                  updateForm('computeMode', event.currentTarget.value as typeof DEFAULT_FORM.computeMode)
-                }
-              />
+            <Field label="CPU only">
+              <button
+                type="button"
+                role="switch"
+                aria-label="CPU only"
+                aria-checked={$activeJob.form.cpuOnly}
+                class="relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background {$activeJob.form.cpuOnly ? 'bg-primary' : 'bg-input'}"
+                onclick={() => updateForm('cpuOnly', !$activeJob.form.cpuOnly)}
+              >
+                <span
+                  class="pointer-events-none inline-block h-5 w-5 transform rounded-full bg-background shadow-lg ring-0 transition duration-200 ease-in-out {$activeJob.form.cpuOnly ? 'translate-x-5' : 'translate-x-0'}"
+                ></span>
+              </button>
             </Field>
 
             <Field label="Whisper model">
@@ -453,11 +454,12 @@
         Chạy pipeline để tạo subtitle.
       </div>
       {:else}
-        {#each $activeJob.translatedSegments as segment, index}
+        {#each $activeJob.translatedSegments.filter(s => s.translatedText.trim() !== '') as segment, filterIndex}
+          {@const originalIndex = $activeJob.translatedSegments.findIndex(s => s.id === segment.id)}
           <div class="rounded-lg border bg-background/70">
             <div class="flex items-center gap-2 border-b px-2.5 py-1.5">
               <span class="w-6 shrink-0 text-center text-md font-semibold text-muted-foreground">
-                {index + 1}
+                {originalIndex + 1}
               </span>
               <div class="flex flex-1 items-center gap-1.5">
                 <Input

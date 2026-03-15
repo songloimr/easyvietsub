@@ -3,13 +3,17 @@ import { formatTimestamp } from '$lib/utils';
 
 export function segmentsToSrt(segments: SubtitleSegment[], useTranslatedText: boolean): string {
   return segments
+    .filter(segment => {
+      const text = useTranslatedText ? segment.translatedText : segment.sourceText;
+      return (text ?? '').trim() !== '';
+    })
     .map((segment, index) => {
       const text = useTranslatedText ? segment.translatedText : segment.sourceText;
 
       return [
         String(index + 1),
         `${formatTimestamp(segment.startMs)} --> ${formatTimestamp(segment.endMs)}`,
-        (text ?? '').trim() || '(empty)',
+        (text ?? '').trim(),
         ''
       ].join('\n');
     })
