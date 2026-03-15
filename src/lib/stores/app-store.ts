@@ -7,13 +7,12 @@ import {
   MAX_LOG_ENTRIES,
   MODEL_DOWNLOAD_PROGRESS_THROTTLE_MS,
   PERSIST_DEBOUNCE_MS,
-  PIPELINE_TIMER_INTERVAL_MS,
   PROGRESS_COMPLETE,
   PROJECT_SCHEMA_VERSION,
   SUBTITLE_UPDATE_DEBOUNCE_MS,
   WHISPER_MODELS
 } from '$lib/constants';
-import { formatError, getErrorDetails, getErrorMessage, isCancelledError } from '$lib/errors';
+import { getErrorDetails, getErrorMessage, isCancelledError } from '$lib/errors';
 import {
   cancelPipelineProcess,
   detectRuntimeCapabilities,
@@ -28,7 +27,6 @@ import {
   loadAppSettings,
   loadProjectSnapshot,
   cleanupJobCache,
-  pathExists,
   persistAppSettings,
   removeLocalFfmpegRuntime,
   removeWhisperModel,
@@ -168,7 +166,6 @@ export const history = writable<JobRecord[]>(persisted.history);
 export const settings = writable<AppSettings>(DEFAULT_SETTINGS);
 export const inspection = writable<MediaInspection | null>(null);
 export const busy = writable(false);
-export const inspectingMedia = writable(false);
 export const installingRuntime = writable(false);
 export const removingRuntime = writable(false);
 export const cancelRequested = writable(false);
@@ -232,7 +229,7 @@ function pushUndoPatch(segmentId: string, translated: boolean, previous: Subtitl
 }
 
 /** Push a full snapshot for bulk operations (e.g. import, batch translate). */
-export function pushUndoSnapshot(): void {
+function pushUndoSnapshot(): void {
   if (isUndoRedoAction) return;
 
   const current = get(activeJob);
@@ -324,11 +321,7 @@ export function redo(): void {
   validationErrors.set(validateSegments(next.translatedSegments));
 }
 
-export function clearUndoRedo(): void {
-  undoStack = [];
-  redoStack = [];
-  updateUndoRedoState();
-}
+
 
 function schedulePersist(): void {
   if (persistTimer) clearTimeout(persistTimer);
@@ -351,7 +344,7 @@ function replaceActiveJob(next: JobRecord): void {
   inspection.set(next.inspection ?? null);
 }
 
-export function recordProcessError(context: string, error: unknown, fallback: string): string {
+function recordProcessError(context: string, error: unknown, fallback: string): string {
   const message = getErrorMessage(error, fallback);
   const details = getErrorDetails(error);
   const job = get(activeJob);
@@ -374,53 +367,6 @@ export function recordProcessError(context: string, error: unknown, fallback: st
   );
 
   return message;
-}
-
-function errorDetail(error: unknown): { detail: string | null; stack: string | null } {
-  if (error instanceof Error) {
-    const detailParts = [error.name !== 'Error' ? error.name : null];
-
-    if (typeof error.cause === 'string') {
-      detailParts.push(error.cause);
-    } else if (error.cause) {
-      try {
-        detailParts.push(JSON.stringify(error.cause, null, 2));
-      } catch {
-        detailParts.push(String(error.cause));
-      }
-    }
-
-    return {
-      detail: detailParts.filter(Boolean).join('\n') || null,
-      stack: error.stack ?? null
-    };
-  }
-
-  if (typeof error === 'string') {
-    return {
-      detail: error,
-      stack: null
-    };
-  }
-
-  if (!error) {
-    return {
-      detail: null,
-      stack: null
-    };
-  }
-
-  try {
-    return {
-      detail: JSON.stringify(error, null, 2),
-      stack: null
-    };
-  } catch {
-    return {
-      detail: String(error),
-      stack: null
-    };
-  }
 }
 
 function applyPipelineEvent(event: PipelineProgressEvent): void {
@@ -638,10 +584,6 @@ export async function removeManagedFfmpeg(): Promise<void> {
   }
 }
 
-export async function removeManagedWhisper(): Promise<void> {
-  // Whisper is now bundled via whisper-rs; no separate runtime removal needed.
-  // This function is kept for backward compatibility with the UI.
-}
 
 export function resetActiveJob(): void {
   cancelRequested.set(false);
@@ -756,7 +698,6 @@ export function restoreSavedApiKey(): string {
 
 export async function inspectSelectedMedia(filePath: string): Promise<void> {
   busy.set(true);
-  inspectingMedia.set(true);
   statusMessage.set('Đang đọc metadata media.');
 
   try {
@@ -786,7 +727,6 @@ export async function inspectSelectedMedia(filePath: string): Promise<void> {
     recordProcessError('Inspect media', error, 'Không thể đọc metadata media.');
   } finally {
     busy.set(false);
-    inspectingMedia.set(false);
   }
 }
 
@@ -1153,18 +1093,7 @@ export async function importProject(path: string): Promise<void> {
   }));
 }
 
-export function relinkProjectMedia(path: string): void {
-  const current = get(activeJob);
-  const next = updateJob(current, {
-    name: path.split(/[\\/]/).pop() ?? current.name,
-    form: {
-      ...current.form,
-      inputPath: path
-    }
-  });
 
-  replaceActiveJob(next);
-}
 
 export function loadJobFromHistory(job: JobRecord): void {
   replaceActiveJob(job);

@@ -1,7 +1,7 @@
 /**
  * Error categories matching the Rust AppError enum
  */
-export type ErrorCategory =
+type ErrorCategory =
   | 'fileSystem'
   | 'network'
   | 'mediaProcessing'
@@ -14,7 +14,7 @@ export type ErrorCategory =
 /**
  * Structured error from Rust backend
  */
-export interface AppError {
+interface AppError {
   category: ErrorCategory;
   message: string;
   // Category-specific optional fields
@@ -31,7 +31,7 @@ export interface AppError {
 /**
  * Check if an error object is a structured AppError
  */
-export function isAppError(error: unknown): error is AppError {
+function isAppError(error: unknown): error is AppError {
   return (
     typeof error === 'object' &&
     error !== null &&
@@ -109,50 +109,3 @@ export function getErrorDetails(error: unknown): string {
   }
 }
 
-/**
- * Vietnamese error messages by category
- */
-export const ERROR_MESSAGES_VI: Record<ErrorCategory, string> = {
-  fileSystem: 'Lỗi hệ thống file',
-  network: 'Lỗi kết nối mạng',
-  mediaProcessing: 'Lỗi xử lý media',
-  model: 'Lỗi model AI',
-  configuration: 'Lỗi cấu hình',
-  cancelled: 'Đã hủy bỏ',
-  validation: 'Lỗi xác thực dữ liệu',
-  unknown: 'Lỗi không xác định'
-};
-
-/**
- * Get localized error category name
- */
-export function getErrorCategoryName(category: ErrorCategory): string {
-  return ERROR_MESSAGES_VI[category];
-}
-
-/**
- * Format error for display in UI
- */
-export interface FormattedError {
-  title: string;
-  message: string;
-  details?: string;
-  category?: ErrorCategory;
-}
-
-export function formatError(error: unknown): FormattedError {
-  if (isAppError(error)) {
-    return {
-      title: getErrorCategoryName(error.category),
-      message: error.message,
-      details: getErrorDetails(error),
-      category: error.category
-    };
-  }
-  
-  return {
-    title: 'Lỗi',
-    message: getErrorMessage(error),
-    details: getErrorDetails(error)
-  };
-}

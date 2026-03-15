@@ -53,20 +53,6 @@ export function formatTimestamp(ms: number): string {
     .padStart(2, '0')}:${seconds.toString().padStart(2, '0')},${millis.toString().padStart(3, '0')}`;
 }
 
-export function parseTimestamp(value: string): number | null {
-  const match = value.match(/^(\d{2}):(\d{2}):(\d{2}),(\d{3})$/);
-  if (!match) {
-    return null;
-  }
-
-  const [, hours, minutes, seconds, millis] = match;
-  return (
-    Number(hours) * 3600000 +
-    Number(minutes) * 60000 +
-    Number(seconds) * 1000 +
-    Number(millis)
-  );
-}
 
 export function createId(prefix = 'id'): string {
   return `${prefix}-${crypto.randomUUID()}`;

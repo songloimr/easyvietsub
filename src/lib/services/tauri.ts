@@ -66,23 +66,7 @@ export async function writeTextContent(path: string, content: string): Promise<v
   await writeTextFile(path, content);
 }
 
-export async function pathExists(path: string): Promise<boolean> {
-  if (!isTauriRuntime()) {
-    return false;
-  }
 
-  const { exists } = await import('@tauri-apps/plugin-fs');
-  return exists(path);
-}
-
-export async function readTextContent(path: string): Promise<string> {
-  if (!isTauriRuntime()) {
-    throw new Error('Tauri runtime is required to read files.');
-  }
-
-  const { readTextFile } = await import('@tauri-apps/plugin-fs');
-  return readTextFile(path);
-}
 
 export async function detectRuntimeCapabilities(): Promise<RuntimeCapabilities> {
   if (!isTauriRuntime()) {
@@ -294,23 +278,6 @@ export async function listenToRuntimeDownloadProgress(
   return unlisten;
 }
 
-export async function getAssetUrl(filePath: string): Promise<string> {
-  // Return empty string for invalid paths
-  if (!filePath || filePath.trim() === '') {
-    console.warn('[getAssetUrl] Empty or invalid file path');
-    return '';
-  }
-
-  if (!isTauriRuntime()) {
-    console.warn('[getAssetUrl] Not running in Tauri, returning original path');
-    return filePath;
-  }
-
-  const { convertFileSrc } = await import('@tauri-apps/api/core');
-  const assetUrl = convertFileSrc(filePath);
-  console.log('[getAssetUrl] Converted:', filePath, '→', assetUrl);
-  return assetUrl;
-}
 
 /**
  * Convert a local file path to a stream:// URL that supports HTTP Range requests.
