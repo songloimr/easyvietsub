@@ -13,7 +13,7 @@ import {
   SUBTITLE_UPDATE_DEBOUNCE_MS,
   WHISPER_MODELS
 } from '$lib/constants';
-import { formatError, getErrorDetails, getErrorMessage } from '$lib/errors';
+import { formatError, getErrorDetails, getErrorMessage, isCancelledError } from '$lib/errors';
 import {
   cancelPipelineProcess,
   detectRuntimeCapabilities,
@@ -960,10 +960,14 @@ export async function startPipeline(apiKey: string): Promise<void> {
         // Save token usage to job
         job = updateJob(job, { tokenUsage: result.tokenUsage });
       } catch (geminiError) {
-        // Gemini failed, but source subtitles are preserved
-        const errorMessage = geminiError instanceof Error ? geminiError.message : String(geminiError);
+        // Re-throw cancel errors so the outer catch handles them properly
+        if (isCancelledError(geminiError)) {
+          throw geminiError;
+        }
+        // Gemini failed, source subtitles are preserved, translated segments left empty
+        const errorMessage = getErrorMessage(geminiError, 'Lỗi không xác định');
         job = updateJob(
-          withPhase(job, 'ready', PROGRESS_COMPLETE, `Dịch thất bại: ${errorMessage}. Đã giữ lại subtitle ngôn ngữ gốc.`),
+          withPhase(job, 'ready', PROGRESS_COMPLETE, `Dịch thất bại: ${errorMessage}.`),
           {
             status: 'partial',
             sourceSegments,
@@ -1018,22 +1022,22 @@ export async function startPipeline(apiKey: string): Promise<void> {
     // Cleanup cache after successful completion.
     cleanupJobCache(job.id).catch(() => {});
   } catch (error) {
-    const isCancelled = error instanceof Error && error.message === 'Job đã bị hủy bởi người dùng.';
+    const cancelled = isCancelledError(error);
     const message = getErrorMessage(error, 'Pipeline thất bại.');
     const next = updateJob(
       withPhase(
         job,
-        isCancelled ? 'cancelled' : 'failed',
+        cancelled ? 'cancelled' : 'failed',
         job.progress,
         message
       ),
       {
-        status: isCancelled ? 'cancelled' : 'failed'
+        status: cancelled ? 'cancelled' : 'failed'
       }
     );
     replaceActiveJob(next);
     // Don't save failed or cancelled jobs to history
-    if (!isCancelled) {
+    if (!cancelled) {
       recordProcessError('Pipeline', error, 'Pipeline thất bại.');
     }
   } finally {
@@ -1091,10 +1095,10 @@ export async function retranslateOnly(apiKey: string): Promise<void> {
     history.update((items) => upsertHistoryEntry(items, job));
     cleanupJobCache(job.id).catch(() => {});
   } catch (error) {
-    const isCancelled = error instanceof Error && error.message === 'Job đã bị hủy bởi người dùng.';
+    const cancelled = isCancelledError(error);
     const message = getErrorMessage(error, 'Dịch lại thất bại.');
 
-    if (isCancelled) {
+    if (cancelled) {
       const next = updateJob(
         withPhase(job, 'cancelled', job.progress, message),
         { status: 'cancelled' }
@@ -1136,6 +1140,7 @@ export async function exportProject(path: string): Promise<void> {
 
 export async function importProject(path: string): Promise<void> {
   const snapshot = await loadProjectSnapshot({ path });
+
   pushUndoSnapshot(); // Save current state before replacing with imported project
   replaceActiveJob(snapshot.job);
   // Only save to history if imported job is completed

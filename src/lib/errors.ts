@@ -41,6 +41,22 @@ export function isAppError(error: unknown): error is AppError {
 }
 
 /**
+ * Check if an error represents a user-initiated cancellation.
+ * Handles both:
+ *  - Tauri backend errors (AppError with category 'cancelled')
+ *  - Frontend throwIfCancelled() errors (Error with specific message)
+ */
+export function isCancelledError(error: unknown): boolean {
+  if (isAppError(error) && error.category === 'cancelled') {
+    return true;
+  }
+  if (error instanceof Error && error.message === 'Job đã bị hủy bởi người dùng.') {
+    return true;
+  }
+  return false;
+}
+
+/**
  * Extract user-friendly error message from various error types
  */
 export function getErrorMessage(error: unknown, fallback = 'Đã xảy ra lỗi không xác định'): string {
