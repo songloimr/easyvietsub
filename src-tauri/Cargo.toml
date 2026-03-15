@@ -34,3 +34,9 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 sevenz-rust = "0.6"
 whisper-rs = { version = "0.14", features = [] }
 memmap2 = "0.9"
+
+[features]
+default = []
+enable-metal = ["whisper-rs/metal"]
+enable-cuda = ["whisper-rs/cuda"]
+enable-vulkan = ["whisper-rs/vulkan"]
