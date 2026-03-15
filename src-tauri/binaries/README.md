@@ -1,16 +1,14 @@
 # Sidecar Binaries
 
-This project is configured to bundle `ffprobe`, `ffmpeg` and `whisper-cli` as Tauri sidecars.
+This project is configured to bundle `ffprobe` and `ffmpeg` as Tauri sidecars.
 
 Current repository contents:
 - `ffmpeg-sidecar-aarch64-apple-darwin`
 - `ffprobe-sidecar-aarch64-apple-darwin`
-- `whisper-cli-sidecar-aarch64-apple-darwin`
 
 These wrappers delegate to the host-installed binaries, or to:
 - `EASYVIETSUB_FFPROBE_BIN`
 - `EASYVIETSUB_FFMPEG_BIN`
-- `EASYVIETSUB_WHISPER_BIN`
 
 ## Building Sidecar Binaries
 
@@ -25,7 +23,6 @@ npm run sidecars:build
 Produces:
 - `ffmpeg-sidecar-aarch64-apple-darwin`
 - `ffprobe-sidecar-aarch64-apple-darwin`
-- `whisper-cli-sidecar-aarch64-apple-darwin`
 
 ### Windows (x64)
 
@@ -36,7 +33,6 @@ npm run sidecars:build:windows
 Produces:
 - `ffmpeg-sidecar-x86_64-pc-windows-msvc.exe`
 - `ffprobe-sidecar-x86_64-pc-windows-msvc.exe`
-- `whisper-cli-sidecar-x86_64-pc-windows-msvc.exe`
 
 ### Custom target
 
@@ -60,4 +56,4 @@ For production packaging on other targets, add target-specific binaries using Ta
 
 ## Source
 
-The `sidecar-launcher` helper source lives in `src-tauri/sidecar-launcher`. It produces tiny native launcher binaries that delegate to `ffprobe`, `ffmpeg`, or `whisper-cli` via PATH or the corresponding `EASYVIETSUB_*_BIN` override env var.
+The `sidecar-launcher` helper source lives in `src-tauri/sidecar-launcher`. It produces tiny native launcher binaries that delegate to `ffprobe` or `ffmpeg` via PATH or the corresponding `EASYVIETSUB_*_BIN` override env var.

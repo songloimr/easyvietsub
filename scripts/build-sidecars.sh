@@ -19,8 +19,7 @@ esac
 
 cp "$OUTPUT_DIR/easyvietsub-sidecar-launcher$EXT" "$BIN_DIR/ffmpeg-sidecar-$TARGET_TRIPLE$EXT"
 cp "$OUTPUT_DIR/easyvietsub-sidecar-launcher$EXT" "$BIN_DIR/ffprobe-sidecar-$TARGET_TRIPLE$EXT"
-cp "$OUTPUT_DIR/easyvietsub-sidecar-launcher$EXT" "$BIN_DIR/whisper-cli-sidecar-$TARGET_TRIPLE$EXT"
 
-chmod +x "$BIN_DIR/ffmpeg-sidecar-$TARGET_TRIPLE$EXT" "$BIN_DIR/ffprobe-sidecar-$TARGET_TRIPLE$EXT" "$BIN_DIR/whisper-cli-sidecar-$TARGET_TRIPLE$EXT" || true
+chmod +x "$BIN_DIR/ffmpeg-sidecar-$TARGET_TRIPLE$EXT" "$BIN_DIR/ffprobe-sidecar-$TARGET_TRIPLE$EXT" || true
 
 echo "Built sidecars for $TARGET_TRIPLE into $BIN_DIR"

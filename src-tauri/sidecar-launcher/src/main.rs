@@ -6,8 +6,6 @@ use std::process::{exit, Command};
 fn select_program(binary_name: &str) -> &'static str {
     if binary_name.contains("ffprobe-sidecar") {
         "ffprobe"
-    } else if binary_name.contains("whisper-cli-sidecar") {
-        "whisper-cli"
     } else {
         "ffmpeg"
     }
@@ -16,7 +14,6 @@ fn select_program(binary_name: &str) -> &'static str {
 fn resolve_override(program: &str) -> Option<OsString> {
     let key = match program {
         "ffprobe" => "EASYVIETSUB_FFPROBE_BIN",
-        "whisper-cli" => "EASYVIETSUB_WHISPER_BIN",
         _ => "EASYVIETSUB_FFMPEG_BIN"
     };
 

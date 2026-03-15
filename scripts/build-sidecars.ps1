@@ -14,6 +14,5 @@ $Launcher = Join-Path $OutputDir "easyvietsub-sidecar-launcher.exe"
 
 Copy-Item $Launcher (Join-Path $BinDir "ffmpeg-sidecar-$TargetTriple.exe") -Force
 Copy-Item $Launcher (Join-Path $BinDir "ffprobe-sidecar-$TargetTriple.exe") -Force
-Copy-Item $Launcher (Join-Path $BinDir "whisper-cli-sidecar-$TargetTriple.exe") -Force
 
 Write-Host "Built sidecars for $TargetTriple into $BinDir"
