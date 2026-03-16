@@ -2394,6 +2394,13 @@ fn load_app_settings(app: AppHandle) -> AppResult<AppSettings> {
 fn atomic_write(path: &std::path::Path, data: &[u8]) -> AppResult<()> {
     let tmp_path = path.with_extension("tmp");
     fs::write(&tmp_path, data).map_err(|e| AppError::file_system(format!("Ghi file tạm thất bại: {e}"), None))?;
+    
+    // Windows cannot rename over an existing file (unlike Unix which atomically replaces)
+    #[cfg(windows)]
+    {
+        let _ = fs::remove_file(path);
+    }
+    
     fs::rename(&tmp_path, path).map_err(|e| AppError::file_system(format!("Rename file thất bại: {e}"), None))
 }
 

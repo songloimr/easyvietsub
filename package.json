@@ -1,7 +1,7 @@
 {
   "name": "easyvietsub",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite dev",
@@ -9,6 +9,14 @@
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "tauri": "tauri",
+    "tauri:dev": "MACOSX_DEPLOYMENT_TARGET=10.15 tauri dev",
+    "tauri:dev:macos": "MACOSX_DEPLOYMENT_TARGET=10.15 tauri dev -- --features enable-metal",
+    "tauri:dev:windows:cuda": "tauri dev -- --features enable-cuda",
+    "tauri:dev:windows:vulkan": "tauri dev -- --features enable-vulkan",
+    "tauri:build:macos": "MACOSX_DEPLOYMENT_TARGET=10.15 tauri build -- --features enable-metal",
+    "tauri:build:windows:cuda": "tauri build -- --features enable-cuda",
+    "tauri:build:windows:vulkan": "tauri build -- --features enable-vulkan",
+    "tauri:build:cpu": "tauri build",
     "sidecars:build": "sh ./scripts/build-sidecars.sh",
     "sidecars:build:windows": "pwsh -File ./scripts/build-sidecars.ps1"
   },

@@ -1,6 +1,6 @@
 [package]
 name = "easyvietsub"
-version = "0.1.0"
+version = "0.2.0"
 description = "Desktop subtitle workflow for Vietnamese localization"
 authors = ["Codex"]
 edition = "2021"
@@ -33,7 +33,7 @@ whisper-rs = { version = "0.14", features = [] }
 memmap2 = "0.9"
 
 [features]
-default = ["enable-metal"]
+default = []
 enable-metal = ["whisper-rs/metal"]
 enable-cuda = ["whisper-rs/cuda"]
 enable-vulkan = ["whisper-rs/vulkan"]

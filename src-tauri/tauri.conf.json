@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "EasyVietsub",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "com.easyvietsub.app",
   "build": {
     "frontendDist": "../build",
@@ -43,6 +43,9 @@
       "../fonts/Arial_Bold.ttf",
       "../fonts/Arial_Italic.ttf",
       "../fonts/Arial_Bold_Italic.ttf"
-    ]
+    ],
+    "macOS": {
+      "minimumSystemVersion": "10.15"
+    }
   }
 }
